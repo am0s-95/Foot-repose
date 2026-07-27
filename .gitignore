@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+
+# next.js
+.next/
+out/
+
+# builds
+dist/
+*.tsbuildinfo
+
+# tests
+coverage/
+test-results/
+playwright-report/
+blob-report/
+
+# environment — never commit real secrets
+.env
+.env.local
+.env.*.local
+
+# misc
+.DS_Store
+npm-debug.log*

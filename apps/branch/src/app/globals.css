@@ -1,0 +1,389 @@
+:root {
+  --bg: #f6f4f1;
+  --surface: #ffffff;
+  --ink: #1c2a2a;
+  --muted: #67737a;
+  --line: #e4e0da;
+  --accent: #0f766e;
+  --accent-ink: #ffffff;
+  --accent-soft: #e6f2f0;
+  --danger: #b3403a;
+  --danger-soft: #f9e9e8;
+  --radius: 10px;
+  --shadow: 0 1px 2px rgb(28 42 42 / 6%), 0 4px 16px rgb(28 42 42 / 5%);
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue',
+    Arial, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+button {
+  font: inherit;
+}
+
+/* ---------- layout ---------- */
+
+.shell {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+.content {
+  width: min(1080px, 100% - 32px);
+  margin: 0 auto;
+  padding: 24px 0 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.page-center {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+/* ---------- top bar ---------- */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.topbar-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.user {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  line-height: 1.2;
+  font-size: 13px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  line-height: 1.15;
+}
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 12px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+
+.brand-sub {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* ---------- controls ---------- */
+
+.input {
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+
+.input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.btn {
+  padding: 8px 14px;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  cursor: pointer;
+  font-weight: 600;
+  transition: filter 120ms ease;
+}
+
+.btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.btn:not(:disabled):hover {
+  filter: brightness(0.96);
+}
+
+.btn.primary {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+.btn.danger {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-color: #ecc9c6;
+}
+
+.btn.ghost {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+.btn.wide {
+  width: 100%;
+}
+
+.chip {
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 13px;
+}
+
+/* ---------- toolbar ---------- */
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px;
+  box-shadow: var(--shadow);
+}
+
+.date-label {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  min-width: 100px;
+  text-align: center;
+}
+
+.toolbar .search {
+  flex: 1 1 220px;
+}
+
+/* ---------- bookings list ---------- */
+
+.bookings {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.booking-card {
+  display: grid;
+  grid-template-columns: 92px 1.2fr 1.3fr 1fr auto;
+  grid-template-areas: 'time who what therapist status' 'time who what therapist actions';
+  align-items: center;
+  column-gap: 16px;
+  row-gap: 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  box-shadow: var(--shadow);
+}
+
+.booking-card .time {
+  grid-area: time;
+  display: flex;
+  flex-direction: column;
+  font-variant-numeric: tabular-nums;
+}
+
+.booking-card .time strong {
+  font-size: 18px;
+}
+
+.booking-card .time span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.booking-card .who {
+  grid-area: who;
+}
+
+.booking-card .what {
+  grid-area: what;
+}
+
+.booking-card .therapist {
+  grid-area: therapist;
+}
+
+.booking-card .who,
+.booking-card .what,
+.booking-card .therapist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.booking-card .status {
+  grid-area: status;
+  justify-self: end;
+}
+
+.booking-card .actions {
+  grid-area: actions;
+  justify-self: end;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 860px) {
+  .booking-card {
+    grid-template-columns: 92px 1fr auto;
+    grid-template-areas: 'time who status' 'time what status' 'time therapist status' 'actions actions actions';
+  }
+
+  .booking-card .actions {
+    justify-self: stretch;
+  }
+
+  .booking-card .actions .btn {
+    flex: 1;
+  }
+}
+
+/* ---------- status badges ---------- */
+
+.status {
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.status-confirmed {
+  background: #e8eefb;
+  color: #2f5bb7;
+}
+
+.status-checked_in {
+  background: #fdf1de;
+  color: #99621b;
+}
+
+.status-in_service {
+  background: #efe9fb;
+  color: #6741b5;
+}
+
+.status-completed {
+  background: #e5f4e8;
+  color: #2c7a3f;
+}
+
+.status-cancelled {
+  background: #eeeeee;
+  color: #616a70;
+}
+
+.status-no_show {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+/* ---------- cards / login ---------- */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 28px;
+  box-shadow: var(--shadow);
+}
+
+.login-card {
+  width: min(380px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.login-brand {
+  margin-bottom: 4px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+/* ---------- misc ---------- */
+
+.muted {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.notice {
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  background: var(--danger-soft);
+  color: var(--danger);
+  border: 1px solid #ecc9c6;
+}
+
+.empty {
+  text-align: center;
+  padding: 48px 16px;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+}
+
+.board-footer {
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+}
