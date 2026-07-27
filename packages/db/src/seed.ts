@@ -16,6 +16,7 @@ import {
 import { createPool, withTransaction } from './client';
 import { loadEnv, requireEnv } from './env';
 import { runMigrations } from './migrations';
+import { assertSeedSafety } from './seed-guards';
 
 export const SEED_PASSWORD = 'FootRepose!Dev1';
 
@@ -81,16 +82,14 @@ function statusForToday(index: number, count: number): BookingStatus {
 }
 
 loadEnv();
-if (process.env.NODE_ENV === 'production') {
-  throw new Error('Refusing to seed a production database.');
-}
+assertSeedSafety({ databaseUrl: requireEnv('DATABASE_URL'), env: process.env });
 
 const pool = createPool(requireEnv('DATABASE_URL'));
 try {
   await runMigrations(pool);
   const summary = await withTransaction(pool, async (tx) => {
     await tx.query(
-      'TRUNCATE audit_logs, bookings, customers, services, employee_branches, employees, branches RESTART IDENTITY CASCADE',
+      'TRUNCATE audit_logs, sessions, bookings, customers, services, employee_branches, employees, branches RESTART IDENTITY CASCADE',
     );
 
     // ---- branches ----

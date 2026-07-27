@@ -4,6 +4,7 @@ import type { Queryable } from '../client';
 export interface BookingRecord {
   id: string;
   branchId: string;
+  branchIsActive: boolean;
   status: BookingStatus;
   startsAt: Date;
   endsAt: Date;
@@ -23,6 +24,7 @@ export interface BookingListFilters {
 interface BookingJoinRow {
   id: string;
   branch_id: string;
+  branch_is_active: boolean;
   status: BookingStatus;
   starts_at: Date;
   ends_at: Date;
@@ -40,11 +42,13 @@ interface BookingJoinRow {
 }
 
 const BOOKING_SELECT = `
-  SELECT b.id, b.branch_id, b.status, b.starts_at, b.ends_at, b.price_baisa, b.currency, b.notes,
+  SELECT b.id, b.branch_id, br.is_active AS branch_is_active,
+         b.status, b.starts_at, b.ends_at, b.price_baisa, b.currency, b.notes,
          s.id AS service_id, s.name AS service_name, s.duration_min AS service_duration_min,
          c.id AS customer_id, c.full_name AS customer_full_name, c.phone AS customer_phone,
          e.id AS assigned_employee_id, e.full_name AS assigned_employee_name
   FROM bookings b
+  JOIN branches br ON br.id = b.branch_id
   JOIN services s ON s.id = b.service_id
   JOIN customers c ON c.id = b.customer_id
   LEFT JOIN employees e ON e.id = b.assigned_employee_id
@@ -54,6 +58,7 @@ function toRecord(row: BookingJoinRow): BookingRecord {
   return {
     id: row.id,
     branchId: row.branch_id,
+    branchIsActive: row.branch_is_active,
     status: row.status,
     startsAt: row.starts_at,
     endsAt: row.ends_at,
