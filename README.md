@@ -40,7 +40,7 @@ cp .env.example .env                      # then edit values
 npm run db:migrate
 SEED_CONFIRM=wipe npm run db:seed         # fictional data; TRUNCATEs everything.
 # Three interlocks: refuses NODE_ENV=production, refuses databases not named
-# *_dev/_development/_local, and refuses to run without SEED_CONFIRM=wipe.
+# *_dev/_development/_local/_test, and refuses to run without SEED_CONFIRM=wipe.
 
 # api needs its own env file
 printf 'DATABASE_URL=...\nAUTH_SECRET=...\n' > apps/api/.env.local
@@ -113,7 +113,10 @@ npm run test:e2e     # Playwright: login → board → check-in → audit (needs
 ```
 
 API tests run against a real PostgreSQL schema: they **drop and recreate**
-the database in `TEST_DATABASE_URL` (must end in `_test`; guard enforced).
+the database in `TEST_DATABASE_URL`. Two independent guards protect real
+data: the fixtures check the URL, and the reset helpers themselves ask the
+live connection (`SELECT current_database()`) and refuse unless the actual
+database name ends exactly in `_test`.
 GitHub Actions (`.github/workflows/ci.yml`) runs all of the above against
 PostgreSQL 16 on every pull request.
 
