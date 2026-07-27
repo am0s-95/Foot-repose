@@ -97,6 +97,14 @@ export async function transitionBooking(
       );
     }
 
+    if (!booking.branchIsActive) {
+      throw new HttpError(
+        409,
+        'conflict',
+        'This branch is inactive — its bookings cannot be transitioned',
+      );
+    }
+
     const to = nextStatus(booking.status, action);
     if (to === null) {
       throw new HttpError(

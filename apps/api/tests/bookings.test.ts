@@ -214,6 +214,50 @@ describe('POST /api/bookings/:bookingId/transition', () => {
     expect((await badAction.json()).error.code).toBe('validation_error');
   });
 
+  it('blocks transitions for bookings of an inactive branch', async () => {
+    const pool = getPool();
+    const branchC = (
+      await pool.query<{ id: string }>(
+        "INSERT INTO branches (code, name, area, phone, is_active) VALUES ('TSC', 'Closing Branch', 'Closing Branch', '+968 24000001', true) RETURNING id",
+      )
+    ).rows[0]!.id;
+    const bookingId = await insertBooking({
+      branchId: branchC,
+      customerId: fx.customerOne,
+      serviceId: fx.service,
+      status: 'confirmed',
+      isoDate: fx.today,
+      hour: 18,
+    });
+    await pool.query('UPDATE branches SET is_active = false WHERE id = $1', [branchC]);
+
+    const denied = await transition(bookingId, superCookie, 'check_in');
+    expect(denied.status).toBe(409);
+    expect((await denied.json()).error.code).toBe('conflict');
+    expect(await countAuditRows('booking.check_in', bookingId)).toBe(0);
+
+    const row = await pool.query<{ status: string }>('SELECT status FROM bookings WHERE id = $1', [
+      bookingId,
+    ]);
+    expect(row.rows[0]!.status).toBe('confirmed');
+  });
+
+  it('rejects state-changing requests from untrusted origins', async () => {
+    const response = await transitionPost(
+      new Request(`http://test.local/api/bookings/${fx.bookings.checkedInA}/transition`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          cookie: staffACookie,
+          origin: 'https://evil.example',
+        },
+        body: JSON.stringify({ action: 'start_service' }),
+      }),
+      { params: Promise.resolve({ bookingId: fx.bookings.checkedInA }) },
+    );
+    expect(response.status).toBe(403);
+  });
+
   it('lets exactly one of two concurrent identical transitions win', async () => {
     const bookingId = await insertBooking({
       branchId: fx.branchA,

@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   addDaysToIsoDate,
@@ -83,8 +83,13 @@ export default function BoardPage() {
     return () => clearTimeout(timer);
   }, [q]);
 
+  /** Monotonic sequence so a slow, older response can never overwrite the
+   * result of a newer request (rapid filter/branch/date changes). */
+  const requestSeq = useRef(0);
+
   const loadBoard = useCallback(async (): Promise<void> => {
     if (!branchId) return;
+    const seq = ++requestSeq.current;
     setLoadingBoard(true);
     try {
       const data = await apiClient.listBookings(branchId, {
@@ -92,16 +97,18 @@ export default function BoardPage() {
         status: statusFilter || undefined,
         q: debouncedQ || undefined,
       });
+      if (seq !== requestSeq.current) return; // stale response — drop it
       setBoard(data);
       setNotice(null);
     } catch (error) {
+      if (seq !== requestSeq.current) return;
       if (error instanceof ApiError && error.status === 401) {
         void toLogin();
         return;
       }
       setNotice(error instanceof ApiError ? error.message : 'Failed to load bookings');
     } finally {
-      setLoadingBoard(false);
+      if (seq === requestSeq.current) setLoadingBoard(false);
     }
   }, [branchId, date, statusFilter, debouncedQ, toLogin]);
 
@@ -147,6 +154,40 @@ export default function BoardPage() {
     return (
       <main className="page-center">
         <p className="muted">Loading…</p>
+      </main>
+    );
+  }
+
+  if (profile.branches.length === 0) {
+    return (
+      <main className="page-center">
+        <div className="card login-card">
+          <div className="brand login-brand">
+            <span className="brand-mark">FR</span>
+            <div>
+              <strong>Foot Repose</strong>
+              <span className="brand-sub">Branch board</span>
+            </div>
+          </div>
+          <p>
+            <strong>No branch assigned</strong>
+          </p>
+          <p className="muted">
+            Your account ({profile.employee.email}) has no branch assignment yet. Ask your branch
+            manager or HQ to assign you to a branch, then sign in again.
+          </p>
+          <button
+            className="btn ghost wide"
+            onClick={() => {
+              void apiClient
+                .logout()
+                .catch(() => undefined)
+                .then(() => router.replace('/login'));
+            }}
+          >
+            Sign out
+          </button>
+        </div>
       </main>
     );
   }
