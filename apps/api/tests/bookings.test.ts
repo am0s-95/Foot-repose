@@ -85,6 +85,7 @@ describe('GET /api/branches/:branchId/bookings', () => {
   it('forbids staff from reading another branch, but not super_admin', async () => {
     const forbidden = await listBookings(fx.branchA, staffBCookie);
     expect(forbidden.status).toBe(403);
+    expect(forbidden.headers.get('cache-control')).toBe('private, no-store');
     const body = await forbidden.json();
     expect(body.error.code).toBe('forbidden');
 
@@ -240,6 +241,46 @@ describe('POST /api/bookings/:bookingId/transition', () => {
       bookingId,
     ]);
     expect(row.rows[0]!.status).toBe('confirmed');
+  });
+
+  it('refuses a transition that races a concurrent branch deactivation', async () => {
+    const pool = getPool();
+    const branchD = (
+      await pool.query<{ id: string }>(
+        "INSERT INTO branches (code, name, area, phone) VALUES ('TSD', 'Racing Branch', 'Racing Branch', '+968 24000002') RETURNING id",
+      )
+    ).rows[0]!.id;
+    const bookingId = await insertBooking({
+      branchId: branchD,
+      customerId: fx.customerOne,
+      serviceId: fx.service,
+      status: 'confirmed',
+      isoDate: fx.today,
+      hour: 19,
+    });
+
+    // Deactivate the branch in an open transaction (uncommitted row lock),
+    // start the transition while it is pending, then commit. The transition
+    // must wait on the branch row and then refuse.
+    const client = await pool.connect();
+    let response: Response;
+    try {
+      await client.query('BEGIN');
+      await client.query('UPDATE branches SET is_active = false WHERE id = $1', [branchD]);
+      const pending = transition(bookingId, superCookie, 'check_in');
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      await client.query('COMMIT');
+      response = await pending;
+    } finally {
+      client.release();
+    }
+
+    expect(response.status).toBe(409);
+    const row = await pool.query<{ status: string }>('SELECT status FROM bookings WHERE id = $1', [
+      bookingId,
+    ]);
+    expect(row.rows[0]!.status).toBe('confirmed');
+    expect(await countAuditRows('booking.check_in', bookingId)).toBe(0);
   });
 
   it('rejects state-changing requests from untrusted origins', async () => {

@@ -36,6 +36,19 @@ export async function listActiveBranches(db: Queryable): Promise<BranchRecord[]>
   return result.rows.map(toRecord);
 }
 
+/**
+ * Read the branch's active flag under FOR SHARE inside the caller's
+ * transaction: a concurrent deactivation (row UPDATE) either committed
+ * before us — we see false — or must wait until our transaction commits.
+ */
+export async function lockBranchIsActive(db: Queryable, branchId: string): Promise<boolean | null> {
+  const result = await db.query<{ is_active: boolean }>(
+    'SELECT is_active FROM branches WHERE id = $1 FOR SHARE',
+    [branchId],
+  );
+  return result.rows[0]?.is_active ?? null;
+}
+
 export async function listBranchesByIds(db: Queryable, ids: readonly string[]): Promise<BranchRecord[]> {
   if (ids.length === 0) return [];
   const result = await db.query<BranchRow>(

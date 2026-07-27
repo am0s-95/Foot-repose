@@ -88,16 +88,19 @@ future customer realm):
 - Sessions are **server-revocable**: the JWT cookie references a
   `sessions` row; logout revokes it, so a kept/stolen token dies
   immediately. Cookie: `fr_wf_session`, HttpOnly, SameSite=Lax.
-- Login is **rate limited** per email+ip (sliding window, audited 429s).
+- Login is **rate limited** per email+ip: fixed 15-minute window stored in
+  PostgreSQL — shared across API instances, survives cold starts, and
+  counts concurrent attempts atomically (audited 429s).
 - State-changing routes enforce an **Origin allowlist** (`ALLOWED_ORIGINS`).
 - Actor-scoped responses ship `cache-control: private, no-store`.
 - `AUTH_SECRET` must be ≥ 32 chars; the `change-me` placeholder is
   rejected at startup.
 
 Architecture boundaries are enforced twice: eslint `no-restricted-imports`
-and `tools/boundaries.test.ts` both fail when a frontend imports the
-database/server modules, when `domain` gains any dependency, or when
-`contracts` touches the database.
+and the path-aware scanner behind `tools/boundaries.test.ts` both fail when
+a frontend imports database/server modules (bare specifiers or relative
+paths into `apps/api`/`packages/db`), when `domain` gains any dependency
+(imports or its package.json), or when `contracts` touches the database.
 
 ## Checks
 

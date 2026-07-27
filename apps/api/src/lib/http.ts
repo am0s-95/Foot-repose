@@ -51,8 +51,12 @@ export function assertTrustedOrigin(req: Request): void {
   }
 }
 
+/** Errors are as actor-specific as successes — never cacheable. */
 export function errorResponse(status: number, code: ApiErrorCode, message: string): Response {
-  return Response.json({ error: { code, message } }, { status });
+  return Response.json(
+    { error: { code, message } },
+    { status, headers: { 'cache-control': 'private, no-store' } },
+  );
 }
 
 /** Wrap a route body: HttpError maps to its status/code, anything else to 500. */

@@ -89,7 +89,7 @@ try {
   await runMigrations(pool);
   const summary = await withTransaction(pool, async (tx) => {
     await tx.query(
-      'TRUNCATE audit_logs, sessions, bookings, customers, services, employee_branches, employees, branches RESTART IDENTITY CASCADE',
+      'TRUNCATE audit_logs, login_rate_limits, sessions, bookings, customers, services, employee_branches, employees, branches RESTART IDENTITY CASCADE',
     );
 
     // ---- branches ----

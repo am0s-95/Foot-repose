@@ -1,40 +1,32 @@
+import {
+  clearLoginAttempts as dbClearLoginAttempts,
+  registerLoginAttempt as dbRegisterLoginAttempt,
+} from '@foot-repose/db';
+import { getPool } from '../../lib/pool';
+
 /**
- * Login rate limiter: sliding window per email+ip.
- * ponytail: in-process Map — the API runs as one instance today; swap for a
- * shared store (Redis/Postgres) when the API scales out.
+ * Login rate limit: fixed window per email+ip, stored in PostgreSQL so the
+ * count is shared across API instances, survives cold starts, and counts
+ * concurrent attempts atomically (single upsert per attempt).
  */
 export const LOGIN_RATE_LIMIT = {
-  WINDOW_MS: 15 * 60_000,
+  WINDOW_SECONDS: 15 * 60,
   MAX_ATTEMPTS: 10,
 } as const;
-
-const failures = new Map<string, number[]>();
 
 export function loginRateLimitKey(email: string, ip: string | null): string {
   return `${email}|${ip ?? 'unknown'}`;
 }
 
-export function isLoginRateLimited(key: string, now = Date.now()): boolean {
-  const recent = (failures.get(key) ?? []).filter(
-    (t) => now - t < LOGIN_RATE_LIMIT.WINDOW_MS,
-  );
-  failures.set(key, recent);
-  return recent.length >= LOGIN_RATE_LIMIT.MAX_ATTEMPTS;
+/** Count this attempt (blocked ones included) and report whether the key is
+ * over the limit. */
+export async function registerLoginAttempt(
+  key: string,
+): Promise<{ limited: boolean; attempts: number }> {
+  const attempts = await dbRegisterLoginAttempt(getPool(), key, LOGIN_RATE_LIMIT.WINDOW_SECONDS);
+  return { limited: attempts > LOGIN_RATE_LIMIT.MAX_ATTEMPTS, attempts };
 }
 
-export function recordFailedLogin(key: string, now = Date.now()): void {
-  const recent = (failures.get(key) ?? []).filter(
-    (t) => now - t < LOGIN_RATE_LIMIT.WINDOW_MS,
-  );
-  recent.push(now);
-  failures.set(key, recent);
-}
-
-export function clearLoginFailures(key: string): void {
-  failures.delete(key);
-}
-
-/** Test helper. */
-export function resetLoginRateLimiter(): void {
-  failures.clear();
+export async function clearLoginFailures(key: string): Promise<void> {
+  await dbClearLoginAttempts(getPool(), key);
 }

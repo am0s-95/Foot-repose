@@ -1,7 +1,6 @@
 import { SignJWT, jwtVerify } from 'jose';
 import type { Actor } from '@foot-repose/domain';
 import {
-  createSession,
   findActiveSession,
   findEmployeeById,
   listActiveBranches,
@@ -19,15 +18,14 @@ import { HttpError } from './http';
  * gets its own cookie, principal table and session store — never share them.
  */
 export const SESSION_COOKIE = 'fr_wf_session';
-const SESSION_TTL_SECONDS = 12 * 60 * 60;
+export const SESSION_TTL_SECONDS = 12 * 60 * 60;
 
 const secretKey = (): Uint8Array => new TextEncoder().encode(env.authSecret);
 
-/** Create a server-side session row and a JWT that references it. Revoking
- * the row invalidates the token no matter what the client still holds. */
-export async function createEmployeeSession(employeeId: string, ip: string | null): Promise<string> {
-  const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000);
-  const sessionId = await createSession(getPool(), { employeeId, expiresAt, ip });
+/** Sign a JWT referencing an existing sessions row (created transactionally
+ * by the auth service). Revoking the row invalidates the token no matter
+ * what the client still holds. */
+export async function signSessionToken(employeeId: string, sessionId: string): Promise<string> {
   return new SignJWT({ sid: sessionId })
     .setProtectedHeader({ alg: 'HS256' })
     .setSubject(employeeId)

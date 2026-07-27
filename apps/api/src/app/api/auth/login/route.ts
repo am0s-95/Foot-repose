@@ -8,9 +8,9 @@ import {
   parseJsonBody,
 } from '../../../../lib/http';
 import {
-  createEmployeeSession,
   loadAuthContext,
   sessionCookie,
+  signSessionToken,
   toProfile,
 } from '../../../../lib/session';
 import { login } from '../../../../modules/auth/service';
@@ -29,7 +29,7 @@ export async function POST(req: Request): Promise<Response> {
     }
     const auth = await loadAuthContext(outcome.employeeId);
     if (!auth) throw new HttpError(401, 'unauthorized', 'Invalid email or password');
-    const token = await createEmployeeSession(outcome.employeeId, ip);
+    const token = await signSessionToken(outcome.employeeId, outcome.sessionId);
     return jsonWithCookie(toProfile(auth), sessionCookie(token));
   });
 }

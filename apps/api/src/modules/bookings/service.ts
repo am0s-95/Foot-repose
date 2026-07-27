@@ -14,6 +14,7 @@ import {
   findBookingById,
   insertAuditLog,
   listBookingsForBranchRange,
+  lockBranchIsActive,
   transitionBookingStatus,
   withTransaction,
   type BookingRecord,
@@ -97,7 +98,10 @@ export async function transitionBooking(
       );
     }
 
-    if (!booking.branchIsActive) {
+    // Lock the branch row (FOR SHARE) so a concurrent deactivation either
+    // already happened — we refuse — or waits for this transaction to end.
+    const branchActive = await lockBranchIsActive(tx, booking.branchId);
+    if (branchActive !== true) {
       throw new HttpError(
         409,
         'conflict',

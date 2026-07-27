@@ -5,7 +5,13 @@ import { POST as logoutPost } from '../src/app/api/auth/logout/route';
 import { GET as meGet } from '../src/app/api/auth/me/route';
 import { GET as branchesGet } from '../src/app/api/branches/route';
 import { GET as publicBranchesGet } from '../src/app/api/public/branches/route';
-import { LOGIN_RATE_LIMIT, resetLoginRateLimiter } from '../src/modules/auth/rate-limit';
+import { LOGIN_RATE_LIMIT } from '../src/modules/auth/rate-limit';
+import { getPool } from '../src/lib/pool';
+import {
+  createPool,
+  registerLoginAttempt as dbRegisterLoginAttempt,
+  resetAllLoginAttempts,
+} from '@foot-repose/db';
 import {
   countAuditRows,
   getReq,
@@ -93,9 +99,10 @@ describe('POST /api/auth/login', () => {
 });
 
 describe('GET /api/auth/me', () => {
-  it('requires a session', async () => {
+  it('requires a session, and the 401 is uncacheable', async () => {
     const response = await meGet(getReq('http://test.local/api/auth/me'));
     expect(response.status).toBe(401);
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
   });
 
   it('rejects a tampered session token', async () => {
@@ -112,24 +119,67 @@ describe('GET /api/auth/me', () => {
   });
 });
 
-describe('login rate limiting', () => {
+describe('login rate limiting (PostgreSQL-backed)', () => {
+  const failedAttempt = (email: string) =>
+    loginPost(
+      postReq('http://test.local/api/auth/login', undefined, {
+        email,
+        password: 'wrong-password',
+      }),
+    );
+
   it('throttles repeated failures per email+ip and audits it', async () => {
-    resetLoginRateLimiter();
-    const attempt = () =>
-      loginPost(
-        postReq('http://test.local/api/auth/login', undefined, {
-          email: 'hammered@test.example',
-          password: 'wrong-password',
-        }),
-      );
+    await resetAllLoginAttempts(getPool());
     for (let i = 0; i < LOGIN_RATE_LIMIT.MAX_ATTEMPTS; i += 1) {
-      expect((await attempt()).status).toBe(401);
+      expect((await failedAttempt('hammered@test.example')).status).toBe(401);
     }
-    const throttled = await attempt();
+    const throttled = await failedAttempt('hammered@test.example');
     expect(throttled.status).toBe(429);
+    expect(throttled.headers.get('cache-control')).toBe('private, no-store');
     expect((await throttled.json()).error.code).toBe('rate_limited');
     expect(await countAuditRows('auth.login_rate_limited')).toBeGreaterThanOrEqual(1);
-    resetLoginRateLimiter();
+    await resetAllLoginAttempts(getPool());
+  });
+
+  it('counts concurrent attempts atomically — no lost increments', async () => {
+    await resetAllLoginAttempts(getPool());
+    const email = 'swarm@test.example';
+    const parallelAttempts = 15;
+    await Promise.all(
+      Array.from({ length: parallelAttempts }, () => failedAttempt(email)),
+    );
+    const row = await getPool().query<{ total: string }>(
+      'SELECT coalesce(sum(attempts), 0) AS total FROM login_rate_limits WHERE key = $1',
+      [`${email}|unknown`],
+    );
+    expect(Number(row.rows[0]!.total)).toBe(parallelAttempts);
+    expect((await failedAttempt(email)).status).toBe(429);
+    await resetAllLoginAttempts(getPool());
+  });
+
+  it('is shared across API instances and survives a cold start', async () => {
+    await resetAllLoginAttempts(getPool());
+    const url = process.env.DATABASE_URL;
+    if (!url) throw new Error('DATABASE_URL missing');
+    const key = 'instances@test.example|10.0.0.9';
+    const instanceA = createPool(url);
+    try {
+      for (let i = 1; i <= 6; i += 1) {
+        expect(await dbRegisterLoginAttempt(instanceA, key, LOGIN_RATE_LIMIT.WINDOW_SECONDS)).toBe(i);
+      }
+    } finally {
+      await instanceA.end(); // instance A disappears (cold start / scale-down)
+    }
+    const instanceB = createPool(url);
+    try {
+      for (let i = 7; i <= 11; i += 1) {
+        expect(await dbRegisterLoginAttempt(instanceB, key, LOGIN_RATE_LIMIT.WINDOW_SECONDS)).toBe(i);
+      }
+      expect(11).toBeGreaterThan(LOGIN_RATE_LIMIT.MAX_ATTEMPTS);
+    } finally {
+      await instanceB.end();
+    }
+    await resetAllLoginAttempts(getPool());
   });
 });
 
