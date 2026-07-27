@@ -1,0 +1,16 @@
+# Local development database. Start with: docker compose up -d
+# Create the test database once with:
+#   docker compose exec db createdb -U postgres foot_repose_test
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: foot_repose_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+volumes:
+  db-data: {}

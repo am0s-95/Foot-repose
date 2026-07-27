@@ -1,0 +1,17 @@
+{
+  "name": "@foot-repose/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./client": "./src/client.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@foot-repose/domain": "*",
+    "zod": "^3.24.0"
+  }
+}

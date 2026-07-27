@@ -1,0 +1,36 @@
+{
+  "name": "foot-repose",
+  "private": true,
+  "engines": {
+    "node": ">=20.9"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present",
+    "db:migrate": "npm run migrate -w @foot-repose/db",
+    "db:seed": "npm run seed -w @foot-repose/db",
+    "dev:api": "npm run dev -w @foot-repose/api",
+    "dev:branch": "npm run dev -w @foot-repose/branch-app",
+    "dev:admin": "npm run dev -w @foot-repose/admin-app",
+    "dev:customer": "npm run dev -w @foot-repose/customer-app"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "eslint": "^9.0.0",
+    "eslint-plugin-react-hooks": "^5.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "~5.9.0",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^3.0.0"
+  }
+}
