@@ -30,8 +30,8 @@ interface BookingJoinRow {
   currency: string;
   notes: string | null;
   service_id: string;
-  service_name: string;
-  service_duration_min: number;
+  service_name_snapshot: string;
+  duration_min_snapshot: number;
   customer_id: string;
   customer_full_name: string;
   customer_phone: string;
@@ -41,11 +41,10 @@ interface BookingJoinRow {
 
 const BOOKING_SELECT = `
   SELECT b.id, b.branch_id, b.status, b.starts_at, b.ends_at, b.price_baisa, b.currency, b.notes,
-         s.id AS service_id, s.name AS service_name, s.duration_min AS service_duration_min,
+         b.service_id, b.service_name_snapshot, b.duration_min_snapshot,
          c.id AS customer_id, c.full_name AS customer_full_name, c.phone AS customer_phone,
          e.id AS assigned_employee_id, e.full_name AS assigned_employee_name
   FROM bookings b
-  JOIN services s ON s.id = b.service_id
   JOIN customers c ON c.id = b.customer_id
   LEFT JOIN employees e ON e.id = b.assigned_employee_id
 `;
@@ -60,7 +59,12 @@ function toRecord(row: BookingJoinRow): BookingRecord {
     priceBaisa: row.price_baisa,
     currency: row.currency,
     notes: row.notes,
-    service: { id: row.service_id, name: row.service_name, durationMin: row.service_duration_min },
+    // Snapshots taken at booking time — later catalog changes never rewrite history.
+    service: {
+      id: row.service_id,
+      name: row.service_name_snapshot,
+      durationMin: row.duration_min_snapshot,
+    },
     customer: { id: row.customer_id, fullName: row.customer_full_name, phone: row.customer_phone },
     assignedEmployee:
       row.assigned_employee_id !== null && row.assigned_employee_name !== null

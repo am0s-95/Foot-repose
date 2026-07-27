@@ -1,3 +1,4 @@
+import type { CustomerSegment } from '@foot-repose/domain';
 import type { Queryable } from '../client';
 
 export interface BranchRecord {
@@ -6,6 +7,7 @@ export interface BranchRecord {
   name: string;
   area: string;
   phone: string;
+  customerSegment: CustomerSegment | null;
   isActive: boolean;
 }
 
@@ -15,10 +17,12 @@ interface BranchRow {
   name: string;
   area: string;
   phone: string;
+  customer_segment: CustomerSegment | null;
   is_active: boolean;
 }
 
-const BRANCH_SELECT = 'SELECT id, code, name, area, phone, is_active FROM branches';
+const BRANCH_SELECT =
+  'SELECT id, code, name, area, phone, customer_segment, is_active FROM branches';
 
 function toRecord(row: BranchRow): BranchRecord {
   return {
@@ -27,6 +31,7 @@ function toRecord(row: BranchRow): BranchRecord {
     name: row.name,
     area: row.area,
     phone: row.phone,
+    customerSegment: row.customer_segment,
     isActive: row.is_active,
   };
 }

@@ -89,7 +89,7 @@ try {
   await runMigrations(pool);
   const summary = await withTransaction(pool, async (tx) => {
     await tx.query(
-      'TRUNCATE audit_logs, login_rate_limits, sessions, bookings, customers, services, employee_branches, employees, branches RESTART IDENTITY CASCADE',
+      'TRUNCATE audit_logs, login_rate_limits, sessions, bookings, branch_service_offerings, customers, services, employee_branches, employees, branches RESTART IDENTITY CASCADE',
     );
 
     // ---- branches ----
@@ -103,7 +103,7 @@ try {
     }
 
     // ---- services ----
-    const services: { id: string; durationMin: number; priceBaisa: number }[] = [];
+    const services: { id: string; name: string; durationMin: number; priceBaisa: number }[] = [];
     for (const service of SERVICES) {
       const result = await tx.query<{ id: string }>(
         'INSERT INTO services (name, duration_min, price_baisa) VALUES ($1, $2, $3) RETURNING id',
@@ -174,6 +174,54 @@ try {
       );
     }
 
+    // ---- versioned offerings: FICTIONAL per-branch variation ----
+    // Proves the catalog supports per-branch prices/durations/history; the
+    // real company's prices are business data entered later, never invented.
+    const nowMs = Date.now();
+    const day = 24 * 60 * 60 * 1000;
+    const currentFrom = new Date(nowMs - 30 * day);
+    let offeringCount = 0;
+    const insertOffering = async (
+      branchId: string,
+      serviceId: string,
+      from: Date,
+      to: Date | null,
+      priceBaisa: number,
+      durationMin: number,
+      isBookableOnline = true,
+    ): Promise<void> => {
+      await tx.query(
+        `INSERT INTO branch_service_offerings
+           (branch_id, service_id, valid_during, price_baisa, duration_min,
+            buffer_before_min, buffer_after_min, is_bookable_online)
+         VALUES ($1, $2, tstzrange($3, $4, '[)'), $5, $6, 0, 10, $7)`,
+        [branchId, serviceId, from, to, priceBaisa, durationMin, isBookableOnline],
+      );
+      offeringCount += 1;
+    };
+    for (const [i, branchId] of branchIds.entries()) {
+      const code = BRANCHES[i]!.code;
+      for (const service of services) {
+        if (code === 'KHD' && service.name === 'Express Revive') continue; // fictional: not offered there
+        const priceBaisa = service.priceBaisa + (i % 3) * 500;
+        const durationMin =
+          code === 'RUW' && service.name === 'Deep Tissue Foot Massage' ? 75 : service.durationMin;
+        const bookableOnline = !(code === 'MTR' && service.name === 'Full Leg & Foot Massage');
+        if (code === 'KHW' && service.name === 'Classic Foot Reflexology') {
+          // history row: an older, cheaper offering that ended 30 days ago
+          await insertOffering(
+            branchId,
+            service.id,
+            new Date(nowMs - 120 * day),
+            currentFrom,
+            priceBaisa - 1000,
+            durationMin,
+          );
+        }
+        await insertOffering(branchId, service.id, currentFrom, null, priceBaisa, durationMin, bookableOnline);
+      }
+    }
+
     // ---- customers (obviously fictional phone block) ----
     const customerIds: string[] = [];
     for (let i = 0; i < CUSTOMER_COUNT; i += 1) {
@@ -204,8 +252,11 @@ try {
       const therapists = staffByBranch.get(branchId)!;
       await tx.query(
         `INSERT INTO bookings
-           (branch_id, customer_id, service_id, assigned_employee_id, status, starts_at, ends_at, price_baisa)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+           (branch_id, customer_id, service_id, assigned_employee_id, status, starts_at, ends_at,
+            price_baisa, service_name_snapshot, duration_min_snapshot,
+            buffer_before_min_snapshot, buffer_after_min_snapshot)
+         SELECT $1, $2, s.id, $4, $5, $6, $7, $8, s.name, s.duration_min, 0, 10
+         FROM services s WHERE s.id = $3`,
         [
           branchId,
           pick(customerIds),
@@ -262,12 +313,19 @@ try {
       ],
     );
 
-    return { branches: branchIds.length, employees: employeeCount, customers: customerIds.length, bookings: bookingCount, today };
+    return {
+      branches: branchIds.length,
+      employees: employeeCount,
+      customers: customerIds.length,
+      bookings: bookingCount,
+      offerings: offeringCount,
+      today,
+    };
   });
 
   console.log(`Seed complete for ${summary.today} (Asia/Muscat):`);
   console.log(
-    `  ${summary.branches} branches, ${summary.employees} employees, ${summary.customers} customers, ${summary.bookings} bookings`,
+    `  ${summary.branches} branches, ${summary.employees} employees, ${summary.customers} customers, ${summary.bookings} bookings, ${summary.offerings} offerings`,
   );
   console.log('  Sample logins (password for all: FootRepose!Dev1):');
   console.log('    super admin -> hq.admin@footrepose.example');
