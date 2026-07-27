@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  addDaysToIsoDate,
   formatMuscatTime,
   isIsoDate,
   muscatDateTimeToUtc,
@@ -27,6 +28,15 @@ describe('isIsoDate', () => {
     expect(isIsoDate('2026-13-01')).toBe(false);
     expect(isIsoDate('2026-04-31')).toBe(false);
     expect(isIsoDate('26-04-01')).toBe(false);
+  });
+});
+
+describe('addDaysToIsoDate', () => {
+  it('adds and subtracts days across month and year boundaries', () => {
+    expect(addDaysToIsoDate('2026-07-27', 1)).toBe('2026-07-28');
+    expect(addDaysToIsoDate('2026-07-01', -1)).toBe('2026-06-30');
+    expect(addDaysToIsoDate('2026-12-31', 1)).toBe('2027-01-01');
+    expect(() => addDaysToIsoDate('bad', 1)).toThrow(RangeError);
   });
 });
 

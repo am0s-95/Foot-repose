@@ -8,6 +8,7 @@
  */
 import bcrypt from 'bcryptjs';
 import {
+  addDaysToIsoDate,
   muscatDateTimeToUtc,
   todayInMuscat,
   type BookingStatus,
@@ -69,11 +70,6 @@ const SERVICES = [
 
 const TOTAL_EMPLOYEES = 160;
 const CUSTOMER_COUNT = 48;
-
-function addDaysIso(isoDate: string, days: number): string {
-  const [y, mo, d] = isoDate.split('-').map(Number);
-  return new Date(Date.UTC(y!, mo! - 1, d! + days)).toISOString().slice(0, 10);
-}
 
 /** Time-coherent status mix for a day of bookings, sorted by start time. */
 function statusForToday(index: number, count: number): BookingStatus {
@@ -236,7 +232,7 @@ try {
       for (let i = 0; i < randInt(3, 4); i += 1) {
         await insertBooking(
           branchId,
-          addDaysIso(today, -1),
+          addDaysToIsoDate(today, -1),
           randInt(10, 20),
           pick([0, 30] as const),
           pick(['completed', 'completed', 'completed', 'no_show', 'cancelled'] as const),
@@ -249,7 +245,7 @@ try {
       }
       // Tomorrow: everything still confirmed.
       for (let i = 0; i < randInt(3, 4); i += 1) {
-        await insertBooking(branchId, addDaysIso(today, 1), randInt(10, 20), pick([0, 30] as const), 'confirmed');
+        await insertBooking(branchId, addDaysToIsoDate(today, 1), randInt(10, 20), pick([0, 30] as const), 'confirmed');
       }
     }
 

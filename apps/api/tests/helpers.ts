@@ -1,5 +1,10 @@
 import bcrypt from 'bcryptjs';
-import { muscatDateTimeToUtc, todayInMuscat, type BookingStatus } from '@foot-repose/domain';
+import {
+  addDaysToIsoDate,
+  muscatDateTimeToUtc,
+  todayInMuscat,
+  type BookingStatus,
+} from '@foot-repose/domain';
 import { resetDatabase } from '@foot-repose/db/testing';
 import type { Pool } from '@foot-repose/db';
 import { getPool } from '../src/lib/pool';
@@ -41,11 +46,6 @@ function assertTestDatabase(): void {
   if (!new URL(url).pathname.endsWith('_test')) {
     throw new Error(`Refusing to run destructive tests against ${url || '(unset DATABASE_URL)'}`);
   }
-}
-
-function addDaysIso(isoDate: string, days: number): string {
-  const [y, mo, d] = isoDate.split('-').map(Number);
-  return new Date(Date.UTC(y!, mo! - 1, d! + days)).toISOString().slice(0, 10);
 }
 
 async function insertBranch(pool: Pool, code: string, name: string): Promise<string> {
@@ -127,7 +127,7 @@ export async function setupFixtures(): Promise<Fixtures> {
   ).rows[0]!.id;
 
   const today = todayInMuscat();
-  const yesterday = addDaysIso(today, -1);
+  const yesterday = addDaysToIsoDate(today, -1);
   const base = { customerId: customerOne, serviceId: service };
   const bookings = {
     confirmedA: await insertBooking({ ...base, branchId: branchA, status: 'confirmed', isoDate: today, hour: 10 }),

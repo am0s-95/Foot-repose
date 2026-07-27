@@ -30,6 +30,13 @@ export function muscatDayUtcRange(isoDate: string): { startUtc: Date; endUtc: Da
   return { startUtc: new Date(startMs), endUtc: new Date(startMs + DAY_MS) };
 }
 
+/** Add (or subtract) whole days to a calendar date. */
+export function addDaysToIsoDate(isoDate: string, days: number): string {
+  if (!isIsoDate(isoDate)) throw new RangeError(`invalid ISO date: ${isoDate}`);
+  const [y, mo, d] = isoDate.split('-').map(Number);
+  return new Date(Date.UTC(y!, mo! - 1, d! + days)).toISOString().slice(0, 10);
+}
+
 /** Current calendar date (YYYY-MM-DD) as seen on a wall clock in Muscat. */
 export function todayInMuscat(now: Date = new Date()): string {
   const shifted = new Date(now.getTime() + MUSCAT_UTC_OFFSET_MINUTES * MINUTE_MS);
