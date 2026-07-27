@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start --port 3000",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "next typegen && tsc --noEmit"
   },
   "dependencies": {
     "@foot-repose/contracts": "*",
