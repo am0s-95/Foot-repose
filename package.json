@@ -11,7 +11,9 @@
   "scripts": {
     "lint": "eslint .",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present",
+    "test": "npm run test:boundaries && npm run test --workspaces --if-present",
+    "test:boundaries": "vitest run --config vitest.root.config.ts",
+    "test:e2e": "playwright test",
     "build": "npm run build --workspaces --if-present",
     "db:migrate": "npm run migrate -w @foot-repose/db",
     "db:seed": "npm run seed -w @foot-repose/db",
