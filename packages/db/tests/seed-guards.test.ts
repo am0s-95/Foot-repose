@@ -13,6 +13,14 @@ describe('assertSeedSafety', () => {
         env: OK_ENV,
       }),
     ).not.toThrow();
+    // _test databases are disposable by definition (integration suites
+    // reseed them), so the seed may run there too.
+    expect(() =>
+      assertSeedSafety({
+        databaseUrl: 'postgres://u:p@localhost:5432/foot_repose_test',
+        env: OK_ENV,
+      }),
+    ).not.toThrow();
   });
 
   it('refuses NODE_ENV=production even with confirmation and a dev name', () => {

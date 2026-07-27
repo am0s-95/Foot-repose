@@ -61,7 +61,13 @@ export const bookingDtoSchema = z.object({
   priceFormatted: z.string(),
   currency: z.literal('OMR'),
   notes: z.string().nullable(),
-  service: z.object({ id: z.string().uuid(), name: z.string(), durationMin: z.number().int() }),
+  service: z.object({
+    id: z.string().uuid(),
+    name: z.string(),
+    durationMin: z.number().int().positive(),
+    bufferBeforeMin: z.number().int().nonnegative(),
+    bufferAfterMin: z.number().int().nonnegative(),
+  }),
   customer: z.object({ id: z.string().uuid(), fullName: z.string(), phone: z.string() }),
   assignedEmployee: z.object({ id: z.string().uuid(), fullName: z.string() }).nullable(),
   /** Actions the CURRENT actor may perform, computed server-side. */

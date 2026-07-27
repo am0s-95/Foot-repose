@@ -120,6 +120,39 @@ describe('GET /api/public/branches/:branchId/services', () => {
     expect(newRow).toMatchObject({ priceBaisa: 5_000, durationMin: 35 });
   });
 
+  it('PostgreSQL rejects any range shape that is not half-open [from,to)', async () => {
+    const pool = getPool();
+    const service = (
+      await pool.query<{ id: string }>(
+        "INSERT INTO services (name, duration_min, price_baisa) VALUES ('Shape Service', 30, 5000) RETURNING id",
+      )
+    ).rows[0]!.id;
+    const from = new Date(Date.now() - 10 * DAY_MS);
+    const to = new Date(Date.now() + 10 * DAY_MS);
+
+    const insertWithBounds = async (bounds: string, lower: Date | null, upper: Date | null) => {
+      try {
+        await pool.query(
+          `INSERT INTO branch_service_offerings
+             (branch_id, service_id, valid_during, price_baisa, duration_min,
+              buffer_before_min, buffer_after_min, is_bookable_online)
+           VALUES ($1, $2, tstzrange($3, $4, $5), 5000, 30, 0, 10, true)`,
+          [fx.branchA, service, lower, upper, bounds],
+        );
+        return null;
+      } catch (error) {
+        return (error as { code?: string }).code ?? 'unknown';
+      }
+    };
+
+    expect(await insertWithBounds('(]', from, to)).toBe('23514'); // check_violation
+    expect(await insertWithBounds('()', from, to)).toBe('23514');
+    expect(await insertWithBounds('[]', from, to)).toBe('23514');
+    expect(await insertWithBounds('[)', null, to)).toBe('23514'); // unbounded lower
+    expect(await insertWithBounds('[)', from, from)).toBe('23514'); // empty range
+    expect(await insertWithBounds('[)', from, null)).toBeNull(); // canonical form passes
+  });
+
   it('PostgreSQL rejects overlapping validity ranges for the same branch+service', async () => {
     const pool = getPool();
     const service = (
@@ -209,11 +242,26 @@ describe('GET /api/public/branches/:branchId/services', () => {
 });
 
 describe('booking snapshots are immutable history', () => {
-  it('keeps old bookings unchanged when the service is renamed or resized', async () => {
+  it('keeps name, duration, price and buffers frozen when the service or offering changes later', async () => {
+    const pool = getPool();
+    // Dedicated service so this test cannot overlap other tests' offerings.
+    const serviceId = (
+      await pool.query<{ id: string }>(
+        "INSERT INTO services (name, duration_min, price_baisa) VALUES ('Snapshot Service', 45, 8500) RETURNING id",
+      )
+    ).rows[0]!.id;
+    const offeringId = await insertOffering({
+      branchId: fx.branchA,
+      serviceId,
+      from: new Date(Date.now() - 5 * DAY_MS),
+      to: null,
+      priceBaisa: 8_500,
+      durationMin: 45,
+    });
     const bookingId = await insertBooking({
       branchId: fx.branchA,
       customerId: fx.customerOne,
-      serviceId: fx.service,
+      serviceId,
       status: 'confirmed',
       isoDate: addDaysToIsoDate(fx.today, 1),
       hour: 12,
@@ -231,21 +279,28 @@ describe('booking snapshots are immutable history', () => {
       return body.bookings.find((b: { id: string }) => b.id === bookingId);
     };
 
-    const before = await readBooking();
-    expect(before.service).toMatchObject({ name: 'Test Reflexology', durationMin: 45 });
+    const frozen = {
+      service: {
+        name: 'Snapshot Service',
+        durationMin: 45,
+        bufferBeforeMin: 0,
+        bufferAfterMin: 10,
+      },
+      priceBaisa: 8500,
+      priceFormatted: 'OMR 8.500',
+    };
+    expect(await readBooking()).toMatchObject(frozen);
 
-    await getPool().query(
+    // Mutate BOTH the service and the offering afterwards.
+    await pool.query(
       "UPDATE services SET name = 'Renamed Service', duration_min = 90 WHERE id = $1",
-      [fx.service],
+      [serviceId],
+    );
+    await pool.query(
+      'UPDATE branch_service_offerings SET price_baisa = 20000, duration_min = 99, buffer_before_min = 5, buffer_after_min = 25 WHERE id = $1',
+      [offeringId],
     );
 
-    const after = await readBooking();
-    expect(after.service).toMatchObject({ name: 'Test Reflexology', durationMin: 45 });
-
-    // Restore for any later assertions in this run.
-    await getPool().query(
-      "UPDATE services SET name = 'Test Reflexology', duration_min = 45 WHERE id = $1",
-      [fx.service],
-    );
+    expect(await readBooking()).toMatchObject(frozen);
   });
 });

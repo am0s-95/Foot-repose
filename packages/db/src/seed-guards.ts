@@ -17,10 +17,10 @@ export function assertSeedSafety(input: {
   } catch {
     throw new Error('Refusing to seed: DATABASE_URL is not a parseable URL.');
   }
-  if (!/_(dev|development|local)$/.test(dbName)) {
+  if (!/_(dev|development|local|test)$/.test(dbName)) {
     throw new Error(
       `Refusing to seed: database "${dbName}" does not look like a development database ` +
-        '(expected a name ending in _dev, _development or _local).',
+        '(expected a name ending in _dev, _development, _local or _test).',
     );
   }
 

@@ -10,7 +10,13 @@ export interface BookingRecord {
   priceBaisa: number;
   currency: string;
   notes: string | null;
-  service: { id: string; name: string; durationMin: number };
+  service: {
+    id: string;
+    name: string;
+    durationMin: number;
+    bufferBeforeMin: number;
+    bufferAfterMin: number;
+  };
   customer: { id: string; fullName: string; phone: string };
   assignedEmployee: { id: string; fullName: string } | null;
 }
@@ -32,6 +38,8 @@ interface BookingJoinRow {
   service_id: string;
   service_name_snapshot: string;
   duration_min_snapshot: number;
+  buffer_before_min_snapshot: number;
+  buffer_after_min_snapshot: number;
   customer_id: string;
   customer_full_name: string;
   customer_phone: string;
@@ -42,6 +50,7 @@ interface BookingJoinRow {
 const BOOKING_SELECT = `
   SELECT b.id, b.branch_id, b.status, b.starts_at, b.ends_at, b.price_baisa, b.currency, b.notes,
          b.service_id, b.service_name_snapshot, b.duration_min_snapshot,
+         b.buffer_before_min_snapshot, b.buffer_after_min_snapshot,
          c.id AS customer_id, c.full_name AS customer_full_name, c.phone AS customer_phone,
          e.id AS assigned_employee_id, e.full_name AS assigned_employee_name
   FROM bookings b
@@ -64,6 +73,8 @@ function toRecord(row: BookingJoinRow): BookingRecord {
       id: row.service_id,
       name: row.service_name_snapshot,
       durationMin: row.duration_min_snapshot,
+      bufferBeforeMin: row.buffer_before_min_snapshot,
+      bufferAfterMin: row.buffer_after_min_snapshot,
     },
     customer: { id: row.customer_id, fullName: row.customer_full_name, phone: row.customer_phone },
     assignedEmployee:
