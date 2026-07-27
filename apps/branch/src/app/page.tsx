@@ -302,7 +302,7 @@ export default function BoardPage() {
         ) : (
           <ul className="bookings">
             {board.bookings.map((booking) => (
-              <li key={booking.id} className="booking-card">
+              <li key={booking.id} className="booking-card" data-booking-id={booking.id}>
                 <div className="time">
                   <strong>{booking.startTimeLocal}</strong>
                   <span>– {booking.endTimeLocal}</span>

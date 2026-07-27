@@ -11,6 +11,9 @@ dist/
 
 # tests
 coverage/
+test-results/
+playwright-report/
+blob-report/
 
 # environment — never commit real secrets
 .env
