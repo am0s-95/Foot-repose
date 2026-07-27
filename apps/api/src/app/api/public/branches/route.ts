@@ -6,14 +6,17 @@ import { getPool } from '../../../../lib/pool';
 export async function GET(): Promise<Response> {
   return handle(async () => {
     const branches = await listActiveBranches(getPool());
-    return jsonResponse({
-      branches: branches.map((branch) => ({
-        id: branch.id,
-        code: branch.code,
-        name: branch.name,
-        area: branch.area,
-        phone: branch.phone,
-      })),
-    });
+    return jsonResponse(
+      {
+        branches: branches.map((branch) => ({
+          id: branch.id,
+          code: branch.code,
+          name: branch.name,
+          area: branch.area,
+          phone: branch.phone,
+        })),
+      },
+      { headers: { 'cache-control': 'public, max-age=300' } },
+    );
   });
 }

@@ -4,6 +4,8 @@ import { POST as loginPost } from '../src/app/api/auth/login/route';
 import { POST as logoutPost } from '../src/app/api/auth/logout/route';
 import { GET as meGet } from '../src/app/api/auth/me/route';
 import { GET as branchesGet } from '../src/app/api/branches/route';
+import { GET as publicBranchesGet } from '../src/app/api/public/branches/route';
+import { LOGIN_RATE_LIMIT, resetLoginRateLimiter } from '../src/modules/auth/rate-limit';
 import {
   countAuditRows,
   getReq,
@@ -34,7 +36,7 @@ describe('POST /api/auth/login', () => {
     );
     expect(response.status).toBe(200);
     const setCookie = response.headers.get('set-cookie') ?? '';
-    expect(setCookie).toContain('fr_session=');
+    expect(setCookie).toContain('fr_wf_session=');
     expect(setCookie).toContain('HttpOnly');
     const profile = await response.json();
     expect(profile.employee.email).toBe('staff.a@test.example');
@@ -98,9 +100,73 @@ describe('GET /api/auth/me', () => {
 
   it('rejects a tampered session token', async () => {
     const response = await meGet(
-      getReq('http://test.local/api/auth/me', 'fr_session=not-a-real-token'),
+      getReq('http://test.local/api/auth/me', 'fr_wf_session=not-a-real-token'),
     );
     expect(response.status).toBe(401);
+  });
+
+  it('marks authenticated responses uncacheable', async () => {
+    const cookie = await loginAs('staff.a@test.example');
+    const response = await meGet(getReq('http://test.local/api/auth/me', cookie));
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
+  });
+});
+
+describe('login rate limiting', () => {
+  it('throttles repeated failures per email+ip and audits it', async () => {
+    resetLoginRateLimiter();
+    const attempt = () =>
+      loginPost(
+        postReq('http://test.local/api/auth/login', undefined, {
+          email: 'hammered@test.example',
+          password: 'wrong-password',
+        }),
+      );
+    for (let i = 0; i < LOGIN_RATE_LIMIT.MAX_ATTEMPTS; i += 1) {
+      expect((await attempt()).status).toBe(401);
+    }
+    const throttled = await attempt();
+    expect(throttled.status).toBe(429);
+    expect((await throttled.json()).error.code).toBe('rate_limited');
+    expect(await countAuditRows('auth.login_rate_limited')).toBeGreaterThanOrEqual(1);
+    resetLoginRateLimiter();
+  });
+});
+
+describe('origin guard on state-changing routes', () => {
+  const loginBody = { email: 'staff.a@test.example', password: TEST_PASSWORD };
+
+  it('rejects browser requests from unknown origins', async () => {
+    const response = await loginPost(
+      new Request('http://test.local/api/auth/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: 'https://evil.example' },
+        body: JSON.stringify(loginBody),
+      }),
+    );
+    expect(response.status).toBe(403);
+    expect((await response.json()).error.code).toBe('forbidden');
+  });
+
+  it('accepts requests from allowed frontend origins', async () => {
+    const response = await loginPost(
+      new Request('http://test.local/api/auth/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: 'http://localhost:3001' },
+        body: JSON.stringify(loginBody),
+      }),
+    );
+    expect(response.status).toBe(200);
+  });
+});
+
+describe('GET /api/public/branches', () => {
+  it('is public and cacheable for a short time', async () => {
+    const response = await publicBranchesGet();
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('public, max-age=300');
+    const body = await response.json();
+    expect(body.branches.length).toBeGreaterThanOrEqual(2);
   });
 });
 
@@ -115,11 +181,17 @@ describe('GET /api/branches', () => {
 });
 
 describe('POST /api/auth/logout', () => {
-  it('clears the cookie and audits the logout', async () => {
+  it('revokes the session server-side: the old cookie stops working', async () => {
     const cookie = await loginAs('manager.a@test.example');
+    expect((await meGet(getReq('http://test.local/api/auth/me', cookie))).status).toBe(200);
+
     const response = await logoutPost(postReq('http://test.local/api/auth/logout', cookie, {}));
     expect(response.status).toBe(200);
     expect(response.headers.get('set-cookie')).toContain('Max-Age=0');
     expect(await countAuditRows('auth.logout', fx.managerA.id)).toBe(1);
+
+    // The client may still hold the JWT — the server must reject it anyway.
+    const reused = await meGet(getReq('http://test.local/api/auth/me', cookie));
+    expect(reused.status).toBe(401);
   });
 });

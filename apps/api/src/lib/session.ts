@@ -1,6 +1,8 @@
 import { SignJWT, jwtVerify } from 'jose';
 import type { Actor } from '@foot-repose/domain';
 import {
+  createSession,
+  findActiveSession,
   findEmployeeById,
   listActiveBranches,
   listBranchesByIds,
@@ -12,13 +14,21 @@ import { env } from './env';
 import { getPool } from './pool';
 import { HttpError } from './http';
 
-export const SESSION_COOKIE = 'fr_session';
+/**
+ * WORKFORCE realm session cookie (employees only). The future customer realm
+ * gets its own cookie, principal table and session store — never share them.
+ */
+export const SESSION_COOKIE = 'fr_wf_session';
 const SESSION_TTL_SECONDS = 12 * 60 * 60;
 
 const secretKey = (): Uint8Array => new TextEncoder().encode(env.authSecret);
 
-export async function createSessionToken(employeeId: string): Promise<string> {
-  return new SignJWT({})
+/** Create a server-side session row and a JWT that references it. Revoking
+ * the row invalidates the token no matter what the client still holds. */
+export async function createEmployeeSession(employeeId: string, ip: string | null): Promise<string> {
+  const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000);
+  const sessionId = await createSession(getPool(), { employeeId, expiresAt, ip });
+  return new SignJWT({ sid: sessionId })
     .setProtectedHeader({ alg: 'HS256' })
     .setSubject(employeeId)
     .setIssuedAt()
@@ -26,10 +36,16 @@ export async function createSessionToken(employeeId: string): Promise<string> {
     .sign(secretKey());
 }
 
-export async function verifySessionToken(token: string): Promise<string | null> {
+export interface SessionClaims {
+  employeeId: string;
+  sessionId: string;
+}
+
+export async function verifySessionToken(token: string): Promise<SessionClaims | null> {
   try {
     const { payload } = await jwtVerify(token, secretKey());
-    return typeof payload.sub === 'string' ? payload.sub : null;
+    if (typeof payload.sub !== 'string' || typeof payload.sid !== 'string') return null;
+    return { employeeId: payload.sub, sessionId: payload.sid };
   } catch {
     return null;
   }
@@ -57,6 +73,9 @@ export interface AuthContext {
   employee: EmployeeRecord;
   /** Branches the employee may operate on (all active ones for super_admin). */
   branches: BranchRecord[];
+  /** Server-side session row backing this request (null right after login,
+   * before the cookie round-trips). */
+  sessionId: string | null;
 }
 
 export async function loadAuthContext(employeeId: string): Promise<AuthContext | null> {
@@ -71,17 +90,23 @@ export async function loadAuthContext(employeeId: string): Promise<AuthContext |
     actor: { employeeId: employee.id, role: employee.role, branchIds: employee.branchIds },
     employee,
     branches,
+    sessionId: null,
   };
 }
 
-/** Resolve the session cookie to a live employee. Re-reads the employee on
- * every request so deactivation takes effect immediately. */
+/** Resolve the session cookie to a live employee. The JWT alone is not
+ * enough: the server-side session row must exist, be un-revoked and
+ * un-expired, and the employee must still be active. */
 export async function getAuthContext(req: Request): Promise<AuthContext | null> {
   const token = readCookie(req, SESSION_COOKIE);
   if (!token) return null;
-  const employeeId = await verifySessionToken(token);
-  if (!employeeId) return null;
-  return loadAuthContext(employeeId);
+  const claims = await verifySessionToken(token);
+  if (!claims) return null;
+  const session = await findActiveSession(getPool(), claims.sessionId, claims.employeeId);
+  if (!session) return null;
+  const auth = await loadAuthContext(claims.employeeId);
+  if (!auth) return null;
+  return { ...auth, sessionId: session.id };
 }
 
 export async function requireAuth(req: Request): Promise<AuthContext> {

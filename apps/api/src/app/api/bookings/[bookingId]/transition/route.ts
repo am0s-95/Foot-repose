@@ -1,5 +1,12 @@
 import { transitionRequestSchema } from '@foot-repose/contracts';
-import { assertUuid, clientIp, handle, jsonResponse, parseJsonBody } from '../../../../../lib/http';
+import {
+  assertTrustedOrigin,
+  assertUuid,
+  clientIp,
+  handle,
+  jsonResponse,
+  parseJsonBody,
+} from '../../../../../lib/http';
 import { requireAuth } from '../../../../../lib/session';
 import { transitionBooking } from '../../../../../modules/bookings/service';
 
@@ -8,6 +15,7 @@ export async function POST(
   ctx: { params: Promise<{ bookingId: string }> },
 ): Promise<Response> {
   return handle(async () => {
+    assertTrustedOrigin(req);
     const auth = await requireAuth(req);
     const { bookingId } = await ctx.params;
     assertUuid(bookingId, 'Booking');

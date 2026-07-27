@@ -1,5 +1,6 @@
 import type { ApiErrorCode } from '@foot-repose/contracts';
 import { z, type ZodError, type ZodType } from 'zod';
+import { env } from './env';
 
 export class HttpError extends Error {
   constructor(
@@ -12,16 +13,42 @@ export class HttpError extends Error {
   }
 }
 
-export function jsonResponse(data: unknown, init?: ResponseInit): Response {
-  return Response.json(data, init);
+/** API responses default to uncacheable: almost everything here is per-actor
+ * data. Public endpoints opt out explicitly via init.headers. */
+export function jsonResponse(
+  data: unknown,
+  init?: ResponseInit & { headers?: Record<string, string> },
+): Response {
+  return Response.json(data, {
+    ...init,
+    headers: { 'cache-control': 'private, no-store', ...(init?.headers ?? {}) },
+  });
 }
 
 /** Constructor form keeps Set-Cookie intact across fetch Headers guards. */
 export function jsonWithCookie(data: unknown, cookie: string, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'content-type': 'application/json', 'set-cookie': cookie },
+    headers: {
+      'content-type': 'application/json',
+      'cache-control': 'private, no-store',
+      'set-cookie': cookie,
+    },
   });
+}
+
+/**
+ * CSRF guard for state-changing routes. Browsers always attach Origin to
+ * cross-site (and same-origin) POSTs; a request from an origin outside the
+ * allowlist is rejected. Requests without Origin (curl, server-to-server)
+ * pass — they carry no ambient browser cookies, which is what CSRF abuses.
+ */
+export function assertTrustedOrigin(req: Request): void {
+  const origin = req.headers.get('origin');
+  if (!origin) return;
+  if (!env.allowedOrigins.includes(origin)) {
+    throw new HttpError(403, 'forbidden', 'Origin not allowed');
+  }
 }
 
 export function errorResponse(status: number, code: ApiErrorCode, message: string): Response {
