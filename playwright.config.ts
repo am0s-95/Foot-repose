@@ -33,5 +33,11 @@ export default defineConfig({
       reuseExistingServer: false,
       timeout: 60_000,
     },
+    {
+      command: 'npm run start -w @foot-repose/customer-app',
+      url: 'http://localhost:3003/',
+      reuseExistingServer: false,
+      timeout: 60_000,
+    },
   ],
 });

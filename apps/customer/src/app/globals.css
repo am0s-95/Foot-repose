@@ -106,3 +106,72 @@ h2 {
   padding: 20px;
   color: var(--muted);
 }
+
+.card-link {
+  color: inherit;
+  text-decoration: none;
+  transition: transform 120ms ease, box-shadow 120ms ease;
+}
+
+.card-link:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 20px rgb(28 42 42 / 12%);
+}
+
+.see-services {
+  margin-top: 6px;
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 13.5px;
+}
+
+.back {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
+  align-self: flex-start;
+}
+
+.back:hover {
+  text-decoration: underline;
+}
+
+.hero.compact {
+  padding: 28px 32px;
+}
+
+.hero.compact h1 {
+  font-size: 24px;
+}
+
+.service-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.service-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 18px;
+  box-shadow: var(--shadow);
+}
+
+.service-row > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.service-row .price {
+  white-space: nowrap;
+  color: var(--accent);
+}
