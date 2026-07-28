@@ -5,6 +5,8 @@ import { Pool } from 'pg';
 import {
   assertLiveDevelopmentDatabase,
   isDevelopmentDatabaseName,
+  prepareSeed,
+  runMigrations,
 } from '@foot-repose/db/testing';
 import { closePool, getPool } from '../src/lib/pool';
 import { setupAllocationFixtures } from './allocation-helpers';
@@ -120,7 +122,80 @@ describe('seed refusal ordering [R4A-4 / A4.1]', () => {
     await prod.end();
   });
 
-  it('[A4.1] refuses before any migration, DDL or DML touches the database', async () => {
+  /**
+   * [A4.1] The ordering proof that actually exercises the live guard.
+   *
+   * A wrong *string* is caught by the textual guard and never reaches
+   * current_database() — so a test using a production-looking URL proves nothing
+   * about the live check. The dangerous case is the opposite: a URL that looks
+   * like a development database while the session is attached to production,
+   * which is exactly what a connection pooler produces.
+   *
+   * `prepareSeed` holds the order, and `migrate` is injected so "never entered"
+   * is directly observable. No production guard is weakened to make this
+   * possible: the same three textual guards run first and pass.
+   */
+  it('[A4.1] never enters migrations when the LIVE database is production', async () => {
+    // Stand the production database up at 0005 with rows that must survive.
+    await runMigrations(prod, { upTo: '0005_scheduling_inputs.sql' });
+    await prod.query(
+      "INSERT INTO branches (code, name, area, phone) VALUES ('SNT', 'Sentinel', 'Sentinel', '+968 24000007')",
+    );
+    const before = await prod.query<{ versions: string; branches: number }>(
+      `SELECT (SELECT string_agg(version, ',' ORDER BY version) FROM schema_migrations) AS versions,
+              (SELECT count(*)::int FROM branches) AS branches`,
+    );
+    expect(before.rows[0]!.versions).toContain('0005_scheduling_inputs.sql');
+    expect(before.rows[0]!.versions).not.toContain('0006');
+
+    let migrateCalls = 0;
+    await expect(
+      prepareSeed({
+        // Textual input looks like a development database: the three textual
+        // guards pass, so the live check is the only thing that can refuse.
+        databaseUrl: 'postgres://postgres:postgres@127.0.0.1:5432/foot_repose_dev',
+        env: { NODE_ENV: 'development', SEED_CONFIRM: 'wipe' },
+        liveDatabaseName: async () =>
+          (await prod.query<{ db: string }>('SELECT current_database() AS db')).rows[0]!.db,
+        migrate: async () => {
+          migrateCalls += 1;
+        },
+      }),
+    ).rejects.toThrow(/Refusing to seed \(before migrations\).*foot_repose_prod/s);
+
+    expect(migrateCalls).toBe(0);
+    const after = await prod.query<{ versions: string; branches: number }>(
+      `SELECT (SELECT string_agg(version, ',' ORDER BY version) FROM schema_migrations) AS versions,
+              (SELECT count(*)::int FROM branches) AS branches`,
+    );
+    expect(after.rows[0]!.versions).toBe(before.rows[0]!.versions);
+    expect(after.rows[0]!.branches).toBe(before.rows[0]!.branches);
+    const newTables = await prod.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM information_schema.tables
+       WHERE table_schema = 'public'
+         AND table_name IN ('booking_provider_allocations', 'booking_resource_allocations',
+                            'resource_types', 'branch_resources')`,
+    );
+    expect(newTables.rows[0]!.n).toBe(0);
+  }, 120_000);
+
+  it('[A4.1] also refuses end-to-end when the URL itself is production', async () => {
+    // The complementary case: the string is wrong too, so the textual guard is
+    // what fires. Asserted as "nothing changed" rather than "nothing exists",
+    // because the test above deliberately left this database at 0005.
+    const snapshot = async (): Promise<string> =>
+      JSON.stringify(
+        (
+          await prod.query(
+            `SELECT (SELECT string_agg(version, ',' ORDER BY version) FROM schema_migrations) AS versions,
+                    (SELECT string_agg(table_name, ',' ORDER BY table_name)
+                       FROM information_schema.tables WHERE table_schema = 'public') AS tables,
+                    (SELECT count(*)::int FROM sentinel) AS sentinels`,
+          )
+        ).rows[0],
+      );
+    const before = await snapshot();
+
     let failed = false;
     try {
       execFileSync('npx', ['tsx', 'src/seed.ts'], {
@@ -134,23 +209,7 @@ describe('seed refusal ordering [R4A-4 / A4.1]', () => {
       expect(String((error as { stderr?: Buffer }).stderr)).toContain('Refusing to seed');
     }
     expect(failed).toBe(true);
-
-    // runMigrations creates schema_migrations as its very first act, so the
-    // absence of that table proves migrations never started.
-    const migrations = await prod.query<{ n: number }>(
-      `SELECT count(*)::int AS n FROM information_schema.tables
-       WHERE table_schema = 'public' AND table_name = 'schema_migrations'`,
-    );
-    expect(migrations.rows[0]!.n).toBe(0);
-
-    const objects = await prod.query<{ n: number }>(
-      `SELECT count(*)::int AS n FROM information_schema.tables
-       WHERE table_schema = 'public' AND table_name <> 'sentinel'`,
-    );
-    expect(objects.rows[0]!.n).toBe(0);
-
-    const sentinel = await prod.query<{ n: number }>('SELECT count(*)::int AS n FROM sentinel');
-    expect(sentinel.rows[0]!.n).toBe(3);
+    expect(await snapshot()).toBe(before);
 
     const flag = await prod.query<{ flag: string | null }>(
       "SELECT current_setting('foot_repose.allow_history_wipe', true) AS flag",

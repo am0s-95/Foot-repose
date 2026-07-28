@@ -11,6 +11,7 @@ import { closePool, getPool } from '../src/lib/pool';
 import {
   allocationErrorOf,
   makeBooking,
+  replaceOffering,
   setupAllocationFixtures,
   sqlstateOf,
   type AllocationFixtures,
@@ -52,42 +53,6 @@ const liveSeqs = async (table: string, bookingId: string): Promise<string[]> => 
   );
   return rows.rows.map((r) => r.allocation_seq);
 };
-
-/** Requirements are frozen once captured, so a test that needs different ones
- * closes the current offering and opens a new version — exactly what the
- * product will have to do. Bookings on DATE fall inside the new version. */
-async function replaceOfferingRequirements(
-  branchId: string,
-  serviceId: string,
-  requirements: { typeId: string; qty: number }[],
-): Promise<string> {
-  await getPool().query(
-    `UPDATE branch_service_offerings
-        SET valid_during = tstzrange(lower(valid_during), '2030-01-01T00:00:00Z', '[)')
-      WHERE branch_id = $1 AND upper(valid_during) IS NULL`,
-    [branchId],
-  );
-  const created = await getPool().query<{ id: string }>(
-    `INSERT INTO branch_service_offerings
-       (branch_id, service_id, valid_during, price_baisa, duration_min,
-        buffer_before_min, buffer_after_min)
-     VALUES ($1, $2, tstzrange('2030-01-01T00:00:00Z', NULL, '[)'), 8500, 45, 0, 10)
-     RETURNING id`,
-    [branchId, serviceId],
-  );
-  const id = created.rows[0]!.id;
-  for (const requirement of requirements) {
-    await getPool().query(
-      'INSERT INTO branch_service_offering_resources VALUES ($1, $2, $3)',
-      [id, requirement.typeId, requirement.qty],
-    );
-  }
-  await getPool().query(
-    'UPDATE branch_service_offerings SET resource_requirements_captured_at = now() WHERE id = $1',
-    [id],
-  );
-  return id;
-}
 
 beforeEach(async () => {
   fx = await setupAllocationFixtures();
@@ -276,8 +241,19 @@ describe('what PostgreSQL refuses', () => {
       { hour: 0, minute: 15, durationMin: 30, bufferBeforeMin: 0, bufferAfterMin: 0 },
       { hour: 22, minute: 0, durationMin: 90, bufferBeforeMin: 45, bufferAfterMin: 60 },
     ];
-    for (const spec of cases) {
-      const id = await book(spec);
+    for (const [index, spec] of cases.entries()) {
+      // The numbers live in the catalog now; the booking inherits them at
+      // capture. Each version starts a day later so the ranges stay disjoint.
+      await replaceOffering({
+        branchId: fx.branchA,
+        serviceId: fx.service,
+        durationMin: spec.durationMin,
+        bufferBeforeMin: spec.bufferBeforeMin,
+        bufferAfterMin: spec.bufferAfterMin,
+        requirements: [{ typeId: fx.chairTypeId, qty: 1 }],
+        effectiveFrom: `2030-01-0${index + 1}T00:00:00Z`,
+      });
+      const id = await book({ hour: spec.hour, minute: spec.minute });
       await captureBookingRequirements(getPool(), id);
       await allocateBooking(getPool(), id, {
         employeeId: fx.staffA.id,
@@ -472,7 +448,14 @@ describe('eligibility, checked under lock [R3-3 / C9.4 / C9.5]', () => {
   });
 
   it('[C9.7] cannot be given a multi-day gap: occupancy over 24 hours is refused outright', async () => {
-    const booking = await book({ hour: 10, durationMin: 26 * 60 });
+    await replaceOffering({
+      branchId: fx.branchA,
+      serviceId: fx.service,
+      durationMin: 26 * 60,
+      bufferAfterMin: 0,
+      requirements: [{ typeId: fx.chairTypeId, qty: 1 }],
+    });
+    const booking = await book({ hour: 10 });
     await captureBookingRequirements(getPool(), booking);
     expect(
       await sqlstateOf(() =>
@@ -491,9 +474,11 @@ describe('eligibility, checked under lock [R3-3 / C9.4 / C9.5]', () => {
 
     // A booking needing TWO chairs, one of which is already claimed.
     const second = await book({ hour: 10, minute: 15 });
-    await replaceOfferingRequirements(fx.branchA, fx.service, [
-      { typeId: fx.chairTypeId, qty: 2 },
-    ]);
+    await replaceOffering({
+      branchId: fx.branchA,
+      serviceId: fx.service,
+      requirements: [{ typeId: fx.chairTypeId, qty: 2 }],
+    });
     await captureBookingRequirements(getPool(), second);
     expect(
       await sqlstateOf(() =>
@@ -795,9 +780,11 @@ describe('requirement snapshots [C1 / R4-2 / R4A-1]', () => {
   });
 
   it('[C7] requires the exact multiset: no duplicates, no extras, no shortfall', async () => {
-    await replaceOfferingRequirements(fx.branchA, fx.service, [
-      { typeId: fx.chairTypeId, qty: 2 },
-    ]);
+    await replaceOffering({
+      branchId: fx.branchA,
+      serviceId: fx.service,
+      requirements: [{ typeId: fx.chairTypeId, qty: 2 }],
+    });
     const booking = await book();
     await captureBookingRequirements(getPool(), booking);
     const attempt = (resourceIds: string[]): Promise<string> =>
@@ -812,6 +799,77 @@ describe('requirement snapshots [C1 / R4-2 / R4A-1]', () => {
       resourceIds: [fx.chairA1, fx.chairA2],
     });
     expect(await liveSeqs('booking_resource_allocations', booking)).toHaveLength(2);
+  });
+});
+
+describe('snapshot provenance [C1]', () => {
+  it('[C1] replaces forged booking snapshots with the source offering\'s own values', async () => {
+    await replaceOffering({
+      branchId: fx.branchA,
+      serviceId: fx.service,
+      durationMin: 60,
+      bufferBeforeMin: 20,
+      bufferAfterMin: 25,
+      priceBaisa: 12_345,
+      requirements: [{ typeId: fx.chairTypeId, qty: 1 }],
+    });
+    // Every snapshot on the booking is wrong on purpose, and the buffers are
+    // forged SMALLER than the branch publishes — the direction that would let a
+    // caller shrink the window the exclusion constraints police.
+    const booking = await book({
+      hour: 10,
+      durationMin: 5,
+      bufferBeforeMin: 0,
+      bufferAfterMin: 0,
+    });
+    const before = await getPool().query<{
+      price_baisa: number;
+      service_name_snapshot: string;
+      duration_min_snapshot: number;
+      buffer_before_min_snapshot: number;
+      buffer_after_min_snapshot: number;
+    }>('SELECT * FROM bookings WHERE id = $1', [booking]);
+    expect(before.rows[0]!.buffer_after_min_snapshot).toBe(0);
+    expect(before.rows[0]!.duration_min_snapshot).toBe(5);
+
+    await captureBookingRequirements(getPool(), booking);
+
+    const after = await getPool().query<{
+      price_baisa: number;
+      service_name_snapshot: string;
+      duration_min_snapshot: number;
+      buffer_before_min_snapshot: number;
+      buffer_after_min_snapshot: number;
+      starts_at: Date;
+      ends_at: Date;
+    }>('SELECT * FROM bookings WHERE id = $1', [booking]);
+    const row = after.rows[0]!;
+    expect(row.price_baisa).toBe(12_345);
+    expect(row.service_name_snapshot).toBe('Test Reflexology');
+    expect(row.duration_min_snapshot).toBe(60);
+    expect(row.buffer_before_min_snapshot).toBe(20);
+    expect(row.buffer_after_min_snapshot).toBe(25);
+    // ends_at is re-derived from the offering's duration, not left at the forged value.
+    expect(row.ends_at.getTime() - row.starts_at.getTime()).toBe(60 * 60_000);
+
+    // And the claim the allocation takes is the OFFERING's window, not the forged one.
+    await allocateBooking(getPool(), booking, {
+      employeeId: fx.staffA.id,
+      resourceIds: [fx.chairA1],
+    });
+    const claim = await getPool().query<{ lo: Date; hi: Date }>(
+      `SELECT lower(occupancy) AS lo, upper(occupancy) AS hi
+       FROM booking_provider_allocations WHERE booking_id = $1`,
+      [booking],
+    );
+    const expected = occupancyOf({
+      startsAt: row.starts_at,
+      endsAt: row.ends_at,
+      bufferBeforeMin: 20,
+      bufferAfterMin: 25,
+    });
+    expect(claim.rows[0]!.lo.toISOString()).toBe(expected.startUtc.toISOString());
+    expect(claim.rows[0]!.hi.toISOString()).toBe(expected.endUtc.toISOString());
   });
 });
 

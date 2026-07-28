@@ -187,7 +187,7 @@ What PostgreSQL enforces itself:
   from two processes are decided by the constraint, never by a check-then-insert.
 - **The claim window cannot be misstated** — `occupancy` is a generated column
   over mirrored booking columns that a composite FK pins to the booking. Direct
-  SQL gets `42601`/`23503`; rescheduling the booking either moves every claim
+  SQL gets `428C9`/`23503`; rescheduling the booking either moves every claim
   atomically (`ON UPDATE CASCADE`) or fails with `23P01`. Occupancy is
   `[starts_at - buffer_before, ends_at + buffer_after)`, so two bookings that
   merely touch are still a conflict, and it is capped at 24 hours — which is what

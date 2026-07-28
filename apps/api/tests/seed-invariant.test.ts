@@ -207,18 +207,29 @@ describe('seed invariants', () => {
     // requires. Bookings without a snapshot are pre-0006 history and are
     // deliberately out of scope — never read as "needs nothing".
     unsatisfiedRequirements: `
-      SELECT count(*)::int AS n FROM (
-        SELECT s.booking_id, r.resource_type_id, r.required_qty,
-               count(a.id) FILTER (WHERE a.released_at IS NULL) AS held
-        FROM booking_resource_requirement_sets s
-        JOIN booking_resource_requirements r ON r.booking_id = s.booking_id
+      WITH holding AS (
+        SELECT s.booking_id FROM booking_resource_requirement_sets s
         JOIN bookings b ON b.id = s.booking_id
-        LEFT JOIN booking_resource_allocations a
-          ON a.booking_id = s.booking_id AND a.resource_type_id = r.resource_type_id
         WHERE s.sealed_at IS NOT NULL
           AND b.status IN ('confirmed', 'checked_in', 'in_service', 'completed')
-        GROUP BY 1, 2, 3
-        HAVING count(a.id) FILTER (WHERE a.released_at IS NULL) <> r.required_qty) t`,
+      ),
+      required AS (
+        SELECT h.booking_id, r.resource_type_id, r.required_qty
+        FROM holding h JOIN booking_resource_requirements r ON r.booking_id = h.booking_id
+      ),
+      held AS (
+        SELECT h.booking_id, a.resource_type_id, count(*)::int AS qty
+        FROM holding h JOIN booking_resource_allocations a ON a.booking_id = h.booking_id
+        WHERE a.released_at IS NULL
+        GROUP BY 1, 2
+      )
+      -- FULL OUTER on purpose: a missing type, an extra type, a wrong quantity
+      -- and a live unit on a sealed ZERO-requirement set are all one comparison.
+      SELECT count(*)::int AS n
+      FROM required r
+      FULL OUTER JOIN held e
+        ON e.booking_id = r.booking_id AND e.resource_type_id = r.resource_type_id
+      WHERE coalesce(r.required_qty, 0) <> coalesce(e.qty, 0)`,
   } as const;
 
   const violations = async (sql: string): Promise<number> =>
@@ -379,6 +390,54 @@ describe('seed invariants', () => {
     }
     // The rollbacks put everything back: the invariants hold again.
     for (const sql of Object.values(INVARIANTS)) expect(await violations(sql)).toBe(0);
+  });
+
+  it('[C5] the requirement invariant catches an EXTRA type and a live unit on a zero-requirement set', async () => {
+    const pool = getPool();
+    // A live unit of a type the booking never required.
+    const extraType = `
+      INSERT INTO booking_resource_allocations
+        (booking_id, branch_id, resource_id, resource_type_id,
+         b_starts_at, b_ends_at, b_buf_before, b_buf_after)
+      SELECT b.id, b.branch_id, r.id, r.resource_type_id, b.starts_at, b.ends_at,
+             b.buffer_before_min_snapshot, b.buffer_after_min_snapshot
+      FROM bookings b
+      JOIN booking_resource_requirement_sets s ON s.booking_id = b.id AND s.sealed_at IS NOT NULL
+      JOIN branch_resources r ON r.branch_id = b.branch_id
+       AND r.resource_type_id NOT IN (SELECT resource_type_id FROM booking_resource_requirements
+                                       WHERE booking_id = b.id)
+      WHERE b.status = 'confirmed'
+        AND NOT EXISTS (SELECT 1 FROM booking_resource_allocations x
+                        WHERE x.resource_id = r.id AND x.released_at IS NULL
+                          AND x.occupancy && tstzrange(b.starts_at, b.ends_at, '[)'))
+      ORDER BY b.id, r.id LIMIT 1`;
+    // A sealed set with ZERO requirements that nevertheless holds a unit: the
+    // old shape started from the requirement rows, so it could not see this at all.
+    const sealedZero = `
+      DELETE FROM booking_resource_requirements
+       WHERE booking_id = (SELECT s.booking_id FROM booking_resource_requirement_sets s
+                           JOIN bookings b ON b.id = s.booking_id
+                           WHERE b.status = 'confirmed' ORDER BY s.booking_id LIMIT 1)`;
+    for (const [name, fixture] of [
+      ['extra unrequired type', extraType],
+      ['sealed zero-requirement set holding a unit', sealedZero],
+    ] as const) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        // The sealing guard is what normally forbids the second fixture; the
+        // point here is that the INVARIANT sees it even if it happened.
+        await client.query('ALTER TABLE booking_resource_requirements DISABLE TRIGGER fr_booking_requirements_guard');
+        await client.query(fixture);
+        const found = Number(
+          (await client.query<{ n: number }>(INVARIANTS.unsatisfiedRequirements)).rows[0]!.n,
+        );
+        expect(`${name} detected ${found}`).toBe(`${name} detected 1`);
+      } finally {
+        await client.query('ROLLBACK').catch(() => undefined);
+        client.release();
+      }
+    }
   });
 
   it('[R8a] seeds every booking with its FULL occupancy inside real availability', async () => {

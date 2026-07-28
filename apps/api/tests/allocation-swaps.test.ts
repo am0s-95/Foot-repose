@@ -264,6 +264,91 @@ describe('two concurrent calls to the swap itself', () => {
     expect(secondError).not.toBe('40P01');
   }, 30_000);
 
+  /**
+   * [C2] The rows that PROVE eligibility are the rows that get locked.
+   *
+   * The earlier shape locked the candidate rows in one statement and counted
+   * coverage in a second: a row that was not a candidate (so never locked) could
+   * be updated into coverage between them, counted, and moved back out before
+   * commit. Now one statement returns the covering rows AND locks them, so a
+   * concurrent writer must wait for the allocation to finish.
+   */
+  async function eligibilityRace(
+    mutate: (client: { query: (sql: string, values?: unknown[]) => Promise<unknown> }) => Promise<unknown>,
+  ): Promise<{ blockedByAllocator: boolean; liveClaims: number }> {
+    const pool = getPool();
+    const booking = await makeBooking({
+      branchId: fx.branchA,
+      isoDate: DATE,
+      hour: 10,
+      serviceId: fx.service,
+      customerId: fx.customerOne,
+    });
+    await captureBookingRequirements(pool, booking);
+
+    const allocator = await pool.connect();
+    const writer = await pool.connect();
+    try {
+      const allocatorPid = await backendPid(allocator);
+      const writerPid = await backendPid(writer);
+      await allocator.query('BEGIN');
+      await allocateBooking(allocator, booking, {
+        employeeId: fx.staffA.id,
+        resourceIds: [fx.chairA1],
+      });
+
+      // The writer tries to move the evidence out of coverage while the
+      // allocation is still open. It must block on the row the allocator locked.
+      await writer.query('BEGIN');
+      const pending = mutate(writer).then(
+        () => 'done',
+        () => 'failed',
+      );
+      const blockers = await waitUntilBlockedBy(pool, writerPid);
+      const blockedByAllocator = blockers.includes(allocatorPid);
+
+      await allocator.query('COMMIT');
+      await pending;
+      await writer.query('COMMIT');
+
+      const live = await pool.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM booking_provider_allocations
+         WHERE booking_id = $1 AND released_at IS NULL`,
+        [booking],
+      );
+      return { blockedByAllocator, liveClaims: live.rows[0]!.n };
+    } finally {
+      allocator.release();
+      writer.release();
+    }
+  }
+
+  it('[C2] a branch assignment cannot be moved out of coverage mid-allocation', async () => {
+    const result = await eligibilityRace((client) =>
+      client.query(
+        `UPDATE provider_branch_assignments
+            SET valid_dates = daterange('2029-01-01'::date, '2029-06-01'::date, '[)')
+          WHERE employee_id = $1 AND branch_id = $2`,
+        [fx.staffA.id, fx.branchA],
+      ),
+    );
+    expect(result.blockedByAllocator).toBe(true);
+    expect(result.liveClaims).toBe(1);
+  }, 30_000);
+
+  it('[C2] a service qualification cannot be moved out of coverage mid-allocation', async () => {
+    const result = await eligibilityRace((client) =>
+      client.query(
+        `UPDATE provider_service_qualifications
+            SET valid_dates = daterange('2029-01-01'::date, '2029-06-01'::date, '[)')
+          WHERE employee_id = $1 AND service_id = $2`,
+        [fx.staffA.id, fx.service],
+      ),
+    );
+    expect(result.blockedByAllocator).toBe(true);
+    expect(result.liveClaims).toBe(1);
+  }, 30_000);
+
   it('[11] two concurrent allocations of the same provider: exactly one succeeds', async () => {
     const pool = getPool();
     const first = await makeBooking({

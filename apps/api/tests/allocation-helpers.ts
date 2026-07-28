@@ -154,6 +154,67 @@ export async function makeBooking(spec: BookingSpec): Promise<string> {
   return result.rows[0]!.id;
 }
 
+export interface OfferingSpec {
+  branchId: string;
+  serviceId: string;
+  durationMin?: number;
+  bufferBeforeMin?: number;
+  bufferAfterMin?: number;
+  priceBaisa?: number;
+  requirements?: { typeId: string; qty: number }[];
+  /** Bookings on and after this instant fall inside the new version. */
+  effectiveFrom?: string;
+}
+
+/**
+ * Close a branch's open-ended offering and open a new version.
+ *
+ * Since `captureBookingRequirements` copies price, name, duration and BOTH
+ * buffers from the effective offering, a test that needs particular numbers has
+ * to state them in the catalog — it can no longer forge them on the booking.
+ * That is the point: the branch's published offering decides how long a booking
+ * occupies a provider and a room.
+ */
+export async function replaceOffering(spec: OfferingSpec): Promise<string> {
+  const pool = getPool();
+  const from = spec.effectiveFrom ?? '2030-01-01T00:00:00Z';
+  await pool.query(
+    `UPDATE branch_service_offerings
+        SET valid_during = tstzrange(lower(valid_during), $2::timestamptz, '[)')
+      WHERE branch_id = $1 AND upper(valid_during) IS NULL`,
+    [spec.branchId, from],
+  );
+  const created = await pool.query<{ id: string }>(
+    `INSERT INTO branch_service_offerings
+       (branch_id, service_id, valid_during, price_baisa, duration_min,
+        buffer_before_min, buffer_after_min)
+     VALUES ($1, $2, tstzrange($3::timestamptz, NULL, '[)'), $4, $5, $6, $7)
+     RETURNING id`,
+    [
+      spec.branchId,
+      spec.serviceId,
+      from,
+      spec.priceBaisa ?? 8500,
+      spec.durationMin ?? 45,
+      spec.bufferBeforeMin ?? 0,
+      spec.bufferAfterMin ?? 10,
+    ],
+  );
+  const id = created.rows[0]!.id;
+  for (const requirement of spec.requirements ?? []) {
+    await pool.query('INSERT INTO branch_service_offering_resources VALUES ($1, $2, $3)', [
+      id,
+      requirement.typeId,
+      requirement.qty,
+    ]);
+  }
+  await pool.query(
+    'UPDATE branch_service_offerings SET resource_requirements_captured_at = now() WHERE id = $1',
+    [id],
+  );
+  return id;
+}
+
 /** SQLSTATE of a failing statement, or 'no error' when it succeeded. */
 export async function sqlstateOf(run: () => Promise<unknown>): Promise<string> {
   try {

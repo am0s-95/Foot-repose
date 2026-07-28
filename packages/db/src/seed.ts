@@ -24,7 +24,7 @@ import {
 import { createPool, withTransaction, type Queryable } from './client';
 import { loadEnv, requireEnv } from './env';
 import { runMigrations } from './migrations';
-import { assertLiveDevelopmentDatabase, assertSeedSafety } from './seed-guards';
+import { assertLiveDevelopmentDatabase, prepareSeed } from './seed-guards';
 import { allocateBooking, captureBookingRequirements } from './repositories/allocations';
 import { applyBookingTransition } from './repositories/bookings';
 import { loadBranchHours, loadProviderSchedule } from './repositories/scheduling';
@@ -84,19 +84,22 @@ const TOTAL_EMPLOYEES = 160;
 const CUSTOMER_COUNT = 48;
 
 loadEnv();
-assertSeedSafety({ databaseUrl: requireEnv('DATABASE_URL'), env: process.env });
 
 const pool = createPool(requireEnv('DATABASE_URL'));
 try {
-  // Guard #4, and the first one that asks the DATABASE rather than a string:
-  // it runs BEFORE runMigrations, so a wrong live database receives no DDL, no
-  // DML and no migration row — not merely no TRUNCATE.
-  assertLiveDevelopmentDatabase(
-    (await pool.query<{ db: string }>('SELECT current_database() AS db')).rows[0]!.db,
-    'before migrations',
-  );
+  // The three textual guards, then the guard that asks the DATABASE rather than
+  // a string, then — and only then — migrations. A connection pooler can route
+  // a dev-looking URL to production, so a wrong live database must receive no
+  // DDL either, not merely no TRUNCATE. `prepareSeed` holds that order in one
+  // place so a test can prove migrations are never entered.
+  await prepareSeed({
+    databaseUrl: requireEnv('DATABASE_URL'),
+    env: process.env,
+    liveDatabaseName: async () =>
+      (await pool.query<{ db: string }>('SELECT current_database() AS db')).rows[0]!.db,
+    migrate: () => runMigrations(pool).then(() => undefined),
+  });
 
-  await runMigrations(pool);
   const summary = await withTransaction(pool, async (tx) => {
     // A pool hands out a different connection than the one checked above, so
     // the destructive transaction re-checks on its own client.

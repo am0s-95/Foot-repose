@@ -148,49 +148,45 @@ async function assertProviderEligible(
     throw new AllocationError('employee_inactive', 'This employee is inactive');
   }
 
-  // Two statements on purpose: FOR SHARE cannot be combined with an aggregate,
-  // so the candidate rows are locked first and then counted. Ending a dated
-  // assignment is an UPDATE that closes its range, and the lock is what stops
-  // one slipping between this check and the write.
-  const [firstDate, lastDate] = [muscatDates[0]!, muscatDates[muscatDates.length - 1]!];
-  await tx.query(
-    `SELECT 1 FROM provider_branch_assignments
-      WHERE employee_id = $1 AND branch_id = $2
-        AND valid_dates && daterange($3::date, ($4::date + 1), '[)')
-      FOR SHARE`,
-    [employeeId, booking.branch_id, firstDate, lastDate],
-  );
-  const assigned = await tx.query<{ covered: number }>(
-    `SELECT count(*)::int AS covered FROM (
-       SELECT d FROM unnest($3::date[]) AS d
-        WHERE EXISTS (SELECT 1 FROM provider_branch_assignments a
-                      WHERE a.employee_id = $1 AND a.branch_id = $2 AND a.valid_dates @> d)
-     ) covered_dates`,
+  // ONE statement per fact, and the rows it returns ARE the evidence: each row
+  // is a date together with the assignment/qualification row that covers it,
+  // and `FOR SHARE OF` locks exactly that covering row. Coverage is then counted
+  // from those locked rows and nothing else.
+  //
+  // The earlier shape — lock the candidates, then aggregate in a second
+  // statement — had a real TOCTOU: a row that was NOT a candidate (so never
+  // locked) could be updated into coverage between the two statements, be
+  // counted by the second, and be updated back out before commit. Evidence that
+  // is not the thing you locked is not evidence.
+  const coveredBy = async (sql: string, values: unknown[]): Promise<number> => {
+    const result = await tx.query<{ covered_date: string }>(sql, values);
+    return new Set(result.rows.map((row) => row.covered_date)).size;
+  };
+
+  const assignedDates = await coveredBy(
+    `SELECT d::text AS covered_date
+       FROM unnest($3::date[]) AS d
+       JOIN provider_branch_assignments a
+         ON a.employee_id = $1 AND a.branch_id = $2 AND a.valid_dates @> d
+      FOR SHARE OF a`,
     [employeeId, booking.branch_id, muscatDates],
   );
-  if (assigned.rows[0]!.covered !== muscatDates.length) {
+  if (assignedDates !== muscatDates.length) {
     throw new AllocationError(
       'not_assigned_to_branch',
       'This provider is not assigned to the branch for every Muscat date the booking occupies',
     );
   }
 
-  await tx.query(
-    `SELECT 1 FROM provider_service_qualifications
-      WHERE employee_id = $1 AND service_id = $2
-        AND valid_dates && daterange($3::date, ($4::date + 1), '[)')
-      FOR SHARE`,
-    [employeeId, booking.service_id, firstDate, lastDate],
-  );
-  const qualified = await tx.query<{ covered: number }>(
-    `SELECT count(*)::int AS covered FROM (
-       SELECT d FROM unnest($3::date[]) AS d
-        WHERE EXISTS (SELECT 1 FROM provider_service_qualifications q
-                      WHERE q.employee_id = $1 AND q.service_id = $2 AND q.valid_dates @> d)
-     ) covered_dates`,
+  const qualifiedDates = await coveredBy(
+    `SELECT d::text AS covered_date
+       FROM unnest($3::date[]) AS d
+       JOIN provider_service_qualifications q
+         ON q.employee_id = $1 AND q.service_id = $2 AND q.valid_dates @> d
+      FOR SHARE OF q`,
     [employeeId, booking.service_id, muscatDates],
   );
-  if (qualified.rows[0]!.covered !== muscatDates.length) {
+  if (qualifiedDates !== muscatDates.length) {
     throw new AllocationError(
       'not_qualified_for_service',
       'This provider is not qualified for the service for every Muscat date the booking occupies',
@@ -366,17 +362,20 @@ export async function captureBookingRequirements(
     const [booking] = await lockBookings(tx, [bookingId]);
     const offering = await tx.query<{
       id: string;
+      service_name: string;
       price_baisa: number;
       duration_min: number;
       buffer_before_min: number;
       buffer_after_min: number;
       captured: Date | null;
     }>(
-      `SELECT o.id, o.price_baisa, o.duration_min, o.buffer_before_min, o.buffer_after_min,
+      `SELECT o.id, s.name AS service_name, o.price_baisa, o.duration_min,
+              o.buffer_before_min, o.buffer_after_min,
               o.resource_requirements_captured_at AS captured
        FROM branch_service_offerings o
+       JOIN services s ON s.id = o.service_id
        WHERE o.branch_id = $1 AND o.service_id = $2 AND o.valid_during @> $3::timestamptz
-       FOR SHARE`,
+       FOR SHARE OF o`,
       [booking!.branch_id, booking!.service_id, booking!.starts_at],
     );
     if (offering.rowCount === 0) {
@@ -392,6 +391,31 @@ export async function captureBookingRequirements(
         'This offering has no captured resource requirements; they cannot be guessed',
       );
     }
+
+    // Every snapshot comes from THIS offering — price, name, duration, both
+    // buffers and the requirements. Reading the offering and then leaving the
+    // booking's own numbers in place would let a caller shrink the occupancy
+    // window below what the branch actually charges for, which is exactly the
+    // window the exclusion constraints police. `ends_at` is re-derived from the
+    // offering's duration for the same reason.
+    await tx.query(
+      `UPDATE bookings b
+          SET price_baisa = $2,
+              service_name_snapshot = $3,
+              duration_min_snapshot = $4,
+              ends_at = fr_shift_minutes(b.starts_at, $4),
+              buffer_before_min_snapshot = $5,
+              buffer_after_min_snapshot = $6
+        WHERE b.id = $1`,
+      [
+        bookingId,
+        source.price_baisa,
+        source.service_name,
+        source.duration_min,
+        source.buffer_before_min,
+        source.buffer_after_min,
+      ],
+    );
 
     await tx.query(
       `INSERT INTO booking_resource_requirement_sets

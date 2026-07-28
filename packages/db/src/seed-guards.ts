@@ -55,3 +55,31 @@ export function assertLiveDevelopmentDatabase(dbName: string, stage: string): vo
     );
   }
 }
+
+export interface SeedPreparation {
+  databaseUrl: string;
+  env: Record<string, string | undefined>;
+  /** What the LIVE connection says it is attached to. */
+  liveDatabaseName: () => Promise<string>;
+  /** Applying migrations — the first thing that would write to the database. */
+  migrate: () => Promise<void>;
+}
+
+/**
+ * The ordering the seed must obey, in one place so it can be proved.
+ *
+ * The textual guards can only see the connection STRING. A connection pooler
+ * routes `.../foot_repose_dev` to whatever database the pool is configured for,
+ * so the string can look perfectly safe while the session is attached to
+ * production. That is why the live check exists — and why it has to run before
+ * `migrate`, not merely before the TRUNCATE: a wrong database must receive no
+ * DDL either.
+ *
+ * `migrate` is injected so a test can prove it is never entered, without
+ * weakening any guard to make the proof possible.
+ */
+export async function prepareSeed(input: SeedPreparation): Promise<void> {
+  assertSeedSafety({ databaseUrl: input.databaseUrl, env: input.env });
+  assertLiveDevelopmentDatabase(await input.liveDatabaseName(), 'before migrations');
+  await input.migrate();
+}

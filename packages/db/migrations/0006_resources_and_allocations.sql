@@ -9,7 +9,7 @@
 --   * a claim's occupancy is DERIVED, never supplied: `occupancy` is a
 --     GENERATED column over mirrored booking columns that a composite foreign
 --     key pins to the booking itself. Direct SQL cannot state a different
---     window (42601 on the generated column, 23503 on the mirrors), and moving
+--     window (428C9 on the generated column, 23503 on the mirrors), and moving
 --     the booking in time either moves every claim atomically (ON UPDATE
 --     CASCADE) or fails with 23P01;
 --   * a resource always belongs to the booking's branch — two composite FKs
@@ -507,8 +507,14 @@ declare
   overlap_count integer;
   overlap_pairs text;
 begin
-  select count(*), string_agg(id::text, ', ' order by id)
-    into bad_buffers, bad_buffer_ids
+  -- The count is over EVERY violating row; only the SAMPLE is capped. Counting
+  -- after a LIMIT would report "20" for a database with hundreds of problems
+  -- and understate the work an operator has to do.
+  select count(*) into bad_buffers
+  from bookings
+   where buffer_before_min_snapshot not between 0 and 1440
+      or buffer_after_min_snapshot not between 0 and 1440;
+  select string_agg(id::text, ', ' order by id) into bad_buffer_ids
   from (select id from bookings
          where buffer_before_min_snapshot not between 0 and 1440
             or buffer_after_min_snapshot not between 0 and 1440
@@ -519,8 +525,12 @@ begin
       bad_buffers, bad_buffer_ids;
   end if;
 
-  select count(*), string_agg(id::text, ', ' order by id)
-    into long_occupancy, long_ids
+  select count(*) into long_occupancy
+  from bookings
+   where (ends_at + make_interval(mins => buffer_after_min_snapshot))
+       - (starts_at - make_interval(mins => buffer_before_min_snapshot))
+         > interval '24 hours';
+  select string_agg(id::text, ', ' order by id) into long_ids
   from (select id from bookings
          where (ends_at + make_interval(mins => buffer_after_min_snapshot))
              - (starts_at - make_interval(mins => buffer_before_min_snapshot))
@@ -532,25 +542,25 @@ begin
       long_occupancy, long_ids;
   end if;
 
-  select count(*), string_agg(pair, '; ' order by pair)
-    into overlap_count, overlap_pairs
+  create temporary table fr_0006_claim on commit drop as
+  select id, assigned_employee_id as employee_id,
+         tstzrange(starts_at - make_interval(mins => buffer_before_min_snapshot),
+                   ends_at + make_interval(mins => buffer_after_min_snapshot),
+                   '[)') as occupancy
+    from bookings
+   where assigned_employee_id is not null
+     and status in ('confirmed', 'checked_in', 'in_service', 'completed');
+
+  select count(*) into overlap_count
+  from fr_0006_claim a join fr_0006_claim b
+    on a.employee_id = b.employee_id and a.id < b.id and a.occupancy && b.occupancy;
+
+  select string_agg(pair, '; ' order by pair) into overlap_pairs
   from (select a.id::text || ' / ' || b.id::text as pair
-        from (select id, assigned_employee_id as employee_id,
-                     tstzrange(starts_at - make_interval(mins => buffer_before_min_snapshot),
-                               ends_at + make_interval(mins => buffer_after_min_snapshot),
-                               '[)') as occupancy
-                from bookings
-               where assigned_employee_id is not null
-                 and status in ('confirmed', 'checked_in', 'in_service', 'completed')) a
-        join (select id, assigned_employee_id as employee_id,
-                     tstzrange(starts_at - make_interval(mins => buffer_before_min_snapshot),
-                               ends_at + make_interval(mins => buffer_after_min_snapshot),
-                               '[)') as occupancy
-                from bookings
-               where assigned_employee_id is not null
-                 and status in ('confirmed', 'checked_in', 'in_service', 'completed')) b
+        from fr_0006_claim a join fr_0006_claim b
           on a.employee_id = b.employee_id and a.id < b.id and a.occupancy && b.occupancy
         order by 1 limit 20) s;
+
   if overlap_count > 0 then
     raise exception
       'migration 0006 preflight: % pre-existing provider double-booking(s) found; '

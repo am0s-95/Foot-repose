@@ -230,6 +230,75 @@ describe('migration 0006 preflight [15 / R6a / R6b]', () => {
     await assertNothingApplied();
   });
 
+  it('[C4] reports the COMPLETE count with a bounded sample when violations exceed 20', async () => {
+    const sentinels = await seedAt0005();
+    // 25 more confirmed bookings, all overlapping the same provider's window,
+    // so every pair among them is a violation — far more than the sample cap.
+    for (let i = 0; i < 25; i += 1) {
+      await getPool().query(
+        `INSERT INTO bookings
+           (branch_id, customer_id, service_id, assigned_employee_id, status, starts_at, ends_at,
+            price_baisa, service_name_snapshot, duration_min_snapshot,
+            buffer_before_min_snapshot, buffer_after_min_snapshot)
+         SELECT branch_id, customer_id, service_id, $2, 'confirmed',
+                starts_at + make_interval(mins => $3), ends_at + make_interval(mins => $3),
+                price_baisa, service_name_snapshot, duration_min_snapshot,
+                buffer_before_min_snapshot, buffer_after_min_snapshot
+         FROM bookings WHERE id = $1`,
+        [sentinels.withProvider, sentinels.employee, i + 1],
+      );
+    }
+    const message = await migrationFailure();
+    const reported = Number(/preflight: (\d+) pre-existing/.exec(message)?.[1]);
+    const exact = await getPool().query<{ n: number }>(
+      `SELECT count(*)::int AS n
+       FROM bookings a JOIN bookings b
+         ON a.assigned_employee_id = b.assigned_employee_id AND a.id < b.id
+        AND tstzrange(a.starts_at - make_interval(mins => a.buffer_before_min_snapshot),
+                      a.ends_at + make_interval(mins => a.buffer_after_min_snapshot), '[)')
+         && tstzrange(b.starts_at - make_interval(mins => b.buffer_before_min_snapshot),
+                      b.ends_at + make_interval(mins => b.buffer_after_min_snapshot), '[)')
+       WHERE a.assigned_employee_id IS NOT NULL
+         AND a.status IN ('confirmed', 'checked_in', 'in_service', 'completed')
+         AND b.status IN ('confirmed', 'checked_in', 'in_service', 'completed')`,
+    );
+    // The complete total, not the size of the sample.
+    expect(reported).toBe(exact.rows[0]!.n);
+    expect(reported).toBeGreaterThan(20);
+    // ...and the sample itself stays bounded.
+    const pairs = (/Pairs: (.*)$/s.exec(message)?.[1] ?? '').split(';').filter(Boolean);
+    expect(pairs.length).toBeLessThanOrEqual(20);
+    await assertNothingApplied();
+  }, 60_000);
+
+  it('[C4] reports the complete count of out-of-range buffers, not the sample size', async () => {
+    await seedAt0005({ bufferAfter: 5000 });
+    for (let i = 0; i < 25; i += 1) {
+      await getPool().query(
+        `INSERT INTO bookings
+           (branch_id, customer_id, service_id, status, starts_at, ends_at, price_baisa,
+            service_name_snapshot, duration_min_snapshot,
+            buffer_before_min_snapshot, buffer_after_min_snapshot)
+         SELECT branch_id, customer_id, service_id, 'confirmed',
+                starts_at + make_interval(days => $1), ends_at + make_interval(days => $1),
+                price_baisa, service_name_snapshot, duration_min_snapshot, 0, 5000
+         FROM bookings ORDER BY id LIMIT 1`,
+        [i + 1],
+      );
+    }
+    const message = await migrationFailure();
+    const reported = Number(/preflight: (\d+) booking\(s\) carry buffer/.exec(message)?.[1]);
+    const exact = await getPool().query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM bookings
+       WHERE buffer_before_min_snapshot NOT BETWEEN 0 AND 1440
+          OR buffer_after_min_snapshot NOT BETWEEN 0 AND 1440`,
+    );
+    expect(reported).toBe(exact.rows[0]!.n);
+    expect(reported).toBeGreaterThan(20);
+    expect((/sample: (.*)$/s.exec(message)?.[1] ?? '').split(',').length).toBeLessThanOrEqual(20);
+    await assertNothingApplied();
+  }, 60_000);
+
   it('[R6b] validates the buffer bounds once the data is clean', async () => {
     await seedAt0005();
     await runMigrations(getPool());
