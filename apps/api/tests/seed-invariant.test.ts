@@ -347,6 +347,10 @@ describe('seed invariants', () => {
       unmarkedFictionalResources: `UPDATE branch_resources SET label = 'Chair 3'
         WHERE id = (SELECT id FROM branch_resources ORDER BY id LIMIT 1)`,
       // Cancel a booking behind the repository's back, leaving its claim live.
+      // This fixture is still reachable INSIDE a transaction only because the
+      // guard that now forbids it is DEFERRED — the state exists until COMMIT,
+      // which is exactly what the invariant query has to be able to see. That
+      // the same statement can never be committed is proven separately below.
       liveClaimsOnNonHoldingBookings: `UPDATE bookings SET status = 'cancelled'
         WHERE id = (SELECT booking_id FROM booking_provider_allocations
                      WHERE released_at IS NULL ORDER BY booking_id LIMIT 1)`,
@@ -377,6 +381,52 @@ describe('seed invariants', () => {
       }
     }
     // The rollbacks put everything back: the invariants hold again.
+    for (const sql of Object.values(INVARIANTS)) expect(await violations(sql)).toBe(0);
+  });
+
+  it('[C2-service] the database refuses to COMMIT either broken parent-row state', async () => {
+    const pool = getPool();
+    const target = await pool.query<{ booking_id: string }>(
+      `SELECT a.booking_id FROM booking_provider_allocations a
+       JOIN bookings b ON b.id = a.booking_id
+       WHERE a.released_at IS NULL AND b.status = 'confirmed'
+       ORDER BY a.booking_id LIMIT 1`,
+    );
+    const bookingId = target.rows[0]!.booking_id;
+
+    // 1. Cancelling behind the repository's back cannot survive COMMIT.
+    const cancelling = await pool.connect();
+    let cancelOutcome = 'no error';
+    try {
+      await cancelling.query('BEGIN');
+      await cancelling.query("UPDATE bookings SET status = 'cancelled' WHERE id = $1", [bookingId]);
+      await cancelling.query('COMMIT');
+    } catch (error) {
+      cancelOutcome = (error as { code?: string }).code ?? 'unknown';
+      await cancelling.query('ROLLBACK').catch(() => undefined);
+    } finally {
+      cancelling.release();
+    }
+    expect(cancelOutcome).toBe('P0001');
+
+    // 2. Re-pointing a seeded booking at another service is refused outright:
+    //    every seeded booking carries a sealed snapshot and live claims.
+    const other = await pool.query<{ id: string }>(
+      'SELECT id FROM services WHERE id <> (SELECT service_id FROM bookings WHERE id = $1) ORDER BY id LIMIT 1',
+      [bookingId],
+    );
+    let serviceOutcome = 'no error';
+    try {
+      await pool.query('UPDATE bookings SET service_id = $2 WHERE id = $1', [
+        bookingId,
+        other.rows[0]!.id,
+      ]);
+    } catch (error) {
+      serviceOutcome = (error as { code?: string }).code ?? 'unknown';
+    }
+    expect(serviceOutcome).toBe('P0001');
+
+    // The seeded database is untouched by either attempt.
     for (const sql of Object.values(INVARIANTS)) expect(await violations(sql)).toBe(0);
   });
 

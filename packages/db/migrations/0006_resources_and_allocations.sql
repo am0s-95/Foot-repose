@@ -25,6 +25,17 @@
 -- What triggers enforce (a constraint provably cannot — a constraint cannot
 -- stop a child row from being DELETEd, and TRUNCATE does not fire DELETE
 -- triggers at all):
+--   * a live claim stays ELIGIBLE and stays ATTACHED TO A BOOKING THAT STILL
+--     HOLDS CAPACITY. Four surfaces, because eligibility can be broken from
+--     four sides and closing three of them proves nothing:
+--       - claim creation, reassignment and movement (allocate / reassign /
+--         swap / the ON UPDATE CASCADE of a reschedule);
+--       - mutation of the eligibility evidence itself (assignment and
+--         qualification rows);
+--       - mutation of the parent booking's own determinants (service_id, and
+--         the status that decides whether a claim may stay live at all);
+--       - the legacy 0005 -> 0006 preflight, which refuses to manufacture a
+--         live claim that would be ineligible the moment it exists;
 --   * requirement snapshots are sealed: after sealing, no INSERT, UPDATE or
 --     DELETE of children, and a child's whole primary key is frozen so a row
 --     can never be relocated out of a sealed parent into an unsealed one;
@@ -585,7 +596,16 @@ begin
     return null;
   end if;
 
-  select b.service_id into service from bookings b where b.id = new.booking_id;
+  -- FIRST link of the documented lock order: the booking row, then the
+  -- eligibility evidence rows below. FOR KEY SHARE is exactly the lock the
+  -- composite foreign key already takes for this INSERT, so it adds no new lock
+  -- class; taking it HERE, before the service is read, is what makes the read
+  -- of `service_id` a locked read rather than a hopeful one. A concurrent
+  -- service change holds FOR UPDATE on the same row (see
+  -- fr_booking_determinant_guard), and the two conflict, so the guard can never
+  -- validate a claim against a service that is already being replaced.
+  select b.service_id into service
+    from bookings b where b.id = new.booking_id for key share;
 
   select count(*) into needed from (
     select (lower(new.occupancy) at time zone 'Asia/Muscat')::date as d
@@ -631,6 +651,154 @@ end $fn$;
 create trigger fr_provider_allocation_eligibility_guard
   after insert or update on booking_provider_allocations
   for each row execute function fr_allocation_eligibility_guard();
+
+-- The THIRD direction: the parent row's own determinants.
+--
+-- Two guards above cover the evidence moving and the claim moving. Neither sees
+-- this one: `service_id` is NOT part of the composite foreign key the claims
+-- carry, so changing it cascades nothing, fires no allocation trigger, and
+-- leaves a live claim by a provider who may not be qualified for the service the
+-- booking now names. A legacy 0005 -> 0006 booking makes it concrete — it has a
+-- live claim and no requirement snapshot at all, so nothing else refuses.
+--
+-- The rule for slice 2A.2b: a booking that carries ANY scheduling footprint may
+-- not change its service. Releasing the live claims first is deliberately NOT
+-- enough. A released claim carries no service of its own — it records that an
+-- employee held a window for a booking — so re-pointing the booking would make
+-- every historical row read as if that service had been performed. Requirement
+-- snapshots are the opposite case: they carry `service_id` explicitly and are
+-- pinned by a composite foreign key, so PostgreSQL already refuses (23503)
+-- there; the guard reaches the case first and says why in one sentence instead.
+--
+-- What this deliberately does NOT do is implement service replacement. That
+-- operation would have to re-snapshot name/duration/price, re-capture
+-- requirements from the new offering and re-allocate, and it is not in this
+-- slice. Until it exists, a different service means a different booking.
+--
+-- Concurrency. `perform ... for update` on the booking row is THE canonical
+-- serialisation point of this slice, and it is the same row `allocateBooking`
+-- locks first. Two orders, both proven by execution (not asserted):
+--   * claim created first — the service UPDATE cannot even reach its own guard
+--     body until that transaction ends, then counts the committed claim and
+--     refuses;
+--   * service changed first — a claim being created blocks on the same row and
+--     its eligibility guard then reads the NEW service.
+-- Measured on 16.13, the guard body never once ran before the wait, with or
+-- without this explicit lock: PostgreSQL takes an exclusive row lock of its own
+-- before firing a BEFORE ROW UPDATE trigger. The lock stays because the
+-- ordering must be stated by this code rather than inherited from an
+-- implementation detail — and because it costs nothing, since it is the very
+-- lock the UPDATE is about to take.
+--
+-- One honest liveness note: a single statement updating the service of SEVERAL
+-- bookings locks them in the plan's row order. Order such a statement by id to
+-- stay inside the global lock order; getting it wrong risks 40P01, never a
+-- double claim.
+create function fr_booking_determinant_guard() returns trigger
+  language plpgsql as $fn$
+declare
+  live_provider integer;
+  released_provider integer;
+  live_resource integer;
+  released_resource integer;
+  requirement_sets integer;
+begin
+  -- Semantic distinctness: assigning the same service (or the same NULL-free
+  -- value twice) is a no-op and is never refused.
+  if new.service_id is not distinct from old.service_id then
+    return new;
+  end if;
+
+  perform 1 from bookings b where b.id = old.id for update;
+
+  select count(*) filter (where released_at is null),
+         count(*) filter (where released_at is not null)
+    into live_provider, released_provider
+    from booking_provider_allocations where booking_id = old.id;
+
+  select count(*) filter (where released_at is null),
+         count(*) filter (where released_at is not null)
+    into live_resource, released_resource
+    from booking_resource_allocations where booking_id = old.id;
+
+  select count(*) into requirement_sets
+    from booking_resource_requirement_sets where booking_id = old.id;
+
+  if live_provider + released_provider + live_resource + released_resource
+     + requirement_sets = 0 then
+    return new;
+  end if;
+
+  raise exception
+    'booking % cannot change service: it carries a scheduling footprint '
+    '(live provider claims %, live resource claims %, released claims %, '
+    'requirement snapshots %). Releasing the live claims is not enough — a '
+    'released claim names no service of its own and would be re-read against '
+    'the new one. Slice 2A.2b has no service-replacement operation: book the '
+    'new service as a new booking.',
+    old.id, live_provider, live_resource,
+    released_provider + released_resource, requirement_sets;
+end $fn$;
+
+create trigger fr_booking_determinant_guard
+  before update on bookings
+  for each row execute function fr_booking_determinant_guard();
+
+-- The same parent-row question for `status`.
+--
+-- A status that no longer holds capacity must free it. That link was a
+-- repository guarantee only, so `UPDATE bookings SET status = 'cancelled'`
+-- through any other path left a provider and a room blocked for a booking
+-- nobody will attend. DEFERRED on purpose: the controlled path sets the status
+-- and then releases inside ONE transaction, and both orders must be allowed
+-- within it — what must never survive is a COMMIT with the two out of step.
+create function fr_booking_status_footprint_guard() returns trigger
+  language plpgsql as $fn$
+declare live integer;
+begin
+  if new.status not in ('cancelled', 'no_show') then return null; end if;
+  select (select count(*) from booking_provider_allocations
+           where booking_id = new.id and released_at is null)
+       + (select count(*) from booking_resource_allocations
+           where booking_id = new.id and released_at is null)
+    into live;
+  if live > 0 then
+    raise exception
+      'booking % is % but still holds % live claim(s); release them in the same '
+      'transaction that changes the status',
+      new.id, new.status, live;
+  end if;
+  return null;
+end $fn$;
+
+create constraint trigger fr_booking_status_footprint_guard
+  after update on bookings
+  deferrable initially deferred
+  for each row execute function fr_booking_status_footprint_guard();
+
+-- ...and the same rule seen from the claim side, so a live claim cannot be
+-- attached to a booking that already stopped holding capacity. Both allocation
+-- tables, because a room is held exactly as literally as a provider is.
+create function fr_claim_booking_state_guard() returns trigger
+  language plpgsql as $fn$
+declare booking_status text;
+begin
+  if new.released_at is not null then return null; end if;
+  select b.status into booking_status
+    from bookings b where b.id = new.booking_id for key share;
+  if booking_status in ('cancelled', 'no_show') then
+    raise exception
+      'booking % is % and cannot hold a live allocation', new.booking_id, booking_status;
+  end if;
+  return null;
+end $fn$;
+
+create trigger fr_provider_claim_booking_state_guard
+  after insert or update on booking_provider_allocations
+  for each row execute function fr_claim_booking_state_guard();
+create trigger fr_resource_claim_booking_state_guard
+  after insert or update on booking_resource_allocations
+  for each row execute function fr_claim_booking_state_guard();
 
 -- TRUNCATE does not fire DELETE triggers, so the guard above is blind to it —
 -- and the development seed truncates through the same DATABASE_URL. A
@@ -803,9 +971,13 @@ alter table bookings validate constraint bookings_buffer_after_bounds;
 -- guess. What is NOT inferred: no provider is invented where the column is
 -- NULL, and NO physical resource and NO requirement set is created for any
 -- pre-0006 booking — there is no inventory to draw on and inventing one is
--- forbidden. Eligibility (branch assignment, qualification) is NOT applied
--- retroactively: 0006 does not invalidate history, it only refuses to build a
--- structure that contradicts itself.
+-- forbidden. Eligibility is not rewritten either, in EITHER direction: 0006
+-- invents no assignment and no qualification row, and it releases nothing. What
+-- it does do is refuse to run at all when a booking would become a live claim
+-- without coverage — the preflight above has already proven every row it is
+-- about to write satisfies the same rule the runtime guards enforce from here
+-- on, so this statement cannot create a claim the database would reject a
+-- second later.
 --
 -- Bookings whose status does not hold a claim are carried over as ALREADY
 -- RELEASED rows rather than dropped, so "who was assigned" survives the column

@@ -25,6 +25,8 @@ interface Sentinels {
   withProvider: string;
   withoutProvider: string;
   cancelled: string;
+  /** A second real service the provider is NOT qualified for. */
+  otherService: string;
 }
 
 async function seedAt0005(overrides: { bufferAfter?: number; durationHours?: number } = {}): Promise<Sentinels> {
@@ -98,9 +100,16 @@ async function seedAt0005(overrides: { bufferAfter?: number; durationHours?: num
     ).id;
   };
 
+  const otherService = (
+    await one<{ id: string }>(
+      "INSERT INTO services (name, duration_min, price_baisa) VALUES ('Other Service', 45, 9000) RETURNING id",
+    )
+  ).id;
+
   return {
     branch,
     employee,
+    otherService,
     withProvider: await insert('confirmed', employee, '2026-07-20T10:00:00Z'),
     withoutProvider: await insert('confirmed', null, '2026-07-20T14:00:00Z'),
     cancelled: await insert('cancelled', employee, '2026-07-20T16:00:00Z'),
@@ -166,6 +175,71 @@ describe('migration 0006 on a database standing at 0005', () => {
     expect(rows.rows[0]!.released).toBe(true);
     expect(rows.rows[0]!.reason).toBe('backfill_non_holding_status');
     expect(rows.rows[0]!.same).toBe(true);
+  });
+
+  /**
+   * [C2-service] The exact starting point that made this a real defect rather
+   * than a theoretical one: a booking carried over from 0005. It has a live
+   * provider claim and ZERO requirement sets — the migration is right not to
+   * invent one — so nothing structural stands between it and a service change.
+   */
+  it('[C2-service] refuses to move a legacy booking to a service its provider is not qualified for', async () => {
+    const pool = getPool();
+    const state = await pool.query<{ live: number; sets: number }>(
+      `SELECT (SELECT count(*)::int FROM booking_provider_allocations
+                WHERE booking_id = $1 AND released_at IS NULL) AS live,
+              (SELECT count(*)::int FROM booking_resource_requirement_sets
+                WHERE booking_id = $1) AS sets`,
+      [sentinels.withProvider],
+    );
+    expect(state.rows[0]!.live).toBe(1);
+    expect(state.rows[0]!.sets).toBe(0);
+
+    const before = await pool.query<{ snapshot: string }>(
+      `SELECT json_build_object(
+                'booking', (SELECT row_to_json(b) FROM bookings b WHERE b.id = $1),
+                'claims', (SELECT json_agg(row_to_json(a) ORDER BY a.allocation_seq)
+                             FROM booking_provider_allocations a WHERE a.booking_id = $1)
+              )::text AS snapshot`,
+      [sentinels.withProvider],
+    );
+
+    let code = 'no error';
+    try {
+      await pool.query('UPDATE bookings SET service_id = $2 WHERE id = $1', [
+        sentinels.withProvider,
+        sentinels.otherService,
+      ]);
+    } catch (error) {
+      code = (error as { code?: string }).code ?? 'unknown';
+    }
+    expect(code).toBe('P0001');
+
+    const after = await pool.query<{ snapshot: string }>(
+      `SELECT json_build_object(
+                'booking', (SELECT row_to_json(b) FROM bookings b WHERE b.id = $1),
+                'claims', (SELECT json_agg(row_to_json(a) ORDER BY a.allocation_seq)
+                             FROM booking_provider_allocations a WHERE a.booking_id = $1)
+              )::text AS snapshot`,
+      [sentinels.withProvider],
+    );
+    expect(after.rows[0]!.snapshot).toBe(before.rows[0]!.snapshot);
+
+    const uncovered = await pool.query<{ n: number }>(
+      `SELECT count(*)::int AS n
+       FROM booking_provider_allocations a
+       JOIN bookings b ON b.id = a.booking_id
+       CROSS JOIN LATERAL (
+         SELECT (lower(a.occupancy) AT TIME ZONE 'Asia/Muscat')::date AS d
+         UNION
+         SELECT ((upper(a.occupancy) - interval '1 microsecond') AT TIME ZONE 'Asia/Muscat')::date
+       ) dates
+       WHERE a.released_at IS NULL
+         AND NOT EXISTS (SELECT 1 FROM provider_service_qualifications q
+                          WHERE q.employee_id = a.employee_id AND q.service_id = b.service_id
+                            AND q.valid_dates @> dates.d)`,
+    );
+    expect(uncovered.rows[0]!.n).toBe(0);
   });
 
   it('drops the old column, leaving one source of truth', async () => {

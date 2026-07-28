@@ -217,24 +217,45 @@ scheduling table are **not** protected and keep their current behaviour. Real
 enforcement needs an application role separate from the migration role, which
 this codebase does not have today.
 
-Eligibility is enforced from **three** ends, because both the evidence and the
-claim can move. A statement-level guard rejects an `UPDATE`/`DELETE` of the
-eligibility tables that would leave a live claim uncovered; a row-level guard
-rejects any live claim — newly inserted, or moved by the reschedule cascade —
-whose NEW window falls outside the provider's assignment or qualification; and
-the `0005 → 0006` preflight aborts rather than backfilling a live claim that
-legacy data cannot justify.
+### Where eligibility is actually enforced
 
-Eligibility is enforced from both ends. Allocation reads the covering
-assignment and qualification rows `FOR SHARE` — the rows it returns *are* the
-evidence, so a concurrent change cannot slip between the check and the write.
-And because a lock only protects the moment of allocation, a statement-level
-guard re-examines any `UPDATE`/`DELETE` of `provider_branch_assignments` or
-`provider_service_qualifications` against the state it produces: if it would
-leave a live claim by a provider who is no longer assigned or qualified, it is
-rejected. Transition tables are used deliberately, so a multi-row statement is
-judged on the complete post-statement state rather than row by row, and both the
-old and the new keys are considered.
+A live claim must be *eligible*, and it must stay eligible. That can be broken
+from four different sides, so all four are named here rather than counted:
+
+- **Claim creation, reassignment and movement.** Allocation reads the covering
+  assignment and qualification rows `FOR SHARE` — the rows it returns *are* the
+  evidence, so a concurrent change cannot slip between the check and the write.
+  A row-level guard then re-judges any live claim — newly inserted, reassigned,
+  or moved by the reschedule cascade — against its **new** window, so a booking
+  moved to a date outside the provider's assignment or qualification is refused.
+- **Mutation of the evidence itself.** A statement-level guard re-examines any
+  `UPDATE`/`DELETE` of `provider_branch_assignments` or
+  `provider_service_qualifications` against the state it produces, and rejects
+  it if a live claim would be left uncovered. Transition tables are used
+  deliberately, so a multi-row statement is judged on the complete
+  post-statement state rather than row by row, and both the old and the new keys
+  are considered.
+- **Mutation of the parent booking's own determinants.** `service_id` is not
+  part of the composite key the claims carry, so changing it cascades nothing
+  and fires no allocation trigger. A booking that carries any scheduling
+  footprint therefore may not change its service at all — and releasing the live
+  claims first is deliberately not enough, because a released claim names no
+  service of its own and would be re-read against the new one. `status` is the
+  same question: a deferred guard refuses to **commit** a booking that stopped
+  holding capacity while it still holds live claims, and the claim side refuses
+  to attach a live claim to such a booking.
+- **The legacy `0005 → 0006` preflight**, which aborts with an exact count and a
+  bounded sample rather than backfilling a live claim that legacy data cannot
+  justify. It invents no eligibility row, releases nothing and rewrites nothing.
+
+The **booking row** is the one canonical serialisation point shared by all of
+them, and the documented lock order starts there: bookings by id, then branches,
+then employees by id, then units by id, then the eligibility evidence rows. A
+service change takes the booking row `FOR UPDATE` inside its guard; claim
+creation takes it `FOR KEY SHARE` — the lock the composite foreign key already
+takes — before it reads the service. Neither commit order can therefore validate
+a claim against a service the other is replacing, and both orders are tested
+with `pg_blocking_pids` barriers rather than sleeps.
 
 Repository guarantees (not constraints), each re-proved over the seed by
 anti-join, each with a safe failure direction:
@@ -259,7 +280,13 @@ offering is proved **at capture time only** — a later reschedule does not
 re-prove it, and slice 2B must revalidate or deliberately keep the original
 capture as provenance. `allocation_seq` is a deterministic *logical* ordering of
 the writes to one booking under its row lock, not wall-clock chronology and not
-an ordering across bookings.
+an ordering across bookings. A **resource** claim carries no service-specific
+eligibility of its own — what ties units to a service is the sealed requirement
+snapshot, and a booking that has one cannot change service at all. There is no
+service-replacement operation in this slice: changing the service of a booking
+that has ever held a provider or a unit would have to re-snapshot name, duration
+and price, re-capture requirements from the new offering and re-allocate, so
+until that exists a different service means a different booking.
 
 ## Checks
 

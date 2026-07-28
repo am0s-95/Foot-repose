@@ -9,10 +9,13 @@ import { closePool, getPool } from '../src/lib/pool';
 import {
   allocationErrorOf,
   backendPid,
+  claimContradictions,
   makeBooking,
+  NO_CONTRADICTIONS,
   setupAllocationFixtures,
   waitUntilBlockedBy,
   type AllocationFixtures,
+  type ClaimContradictions,
 } from './allocation-helpers';
 
 /**
@@ -572,6 +575,145 @@ describe('two concurrent calls to the swap itself', () => {
   it('[C2-reschedule] eligibility change first, then the reschedule: no uncovered claim', async () => {
     const result = await rescheduleVersusEligibility('eligibility-first');
     expect(result.uncovered).toBe(0);
+    expect(result.deadlocks).toBe(0);
+  }, 30_000);
+
+  /**
+   * [C2-service] The booking's own determinant against claim creation.
+   *
+   * One canonical serialisation point decides both orders: the BOOKING ROW.
+   * The service mutation takes it FOR UPDATE inside its guard; claim creation
+   * takes it FOR KEY SHARE inside the eligibility guard, before it reads the
+   * service. Neither can therefore read a service the other is replacing.
+   *
+   * `kind` picks WHICH claim races the mutation, because a room is held exactly
+   * as literally as a provider is and the two are created independently.
+   */
+  async function serviceChangeVersusClaim(
+    order: 'claim-first' | 'service-first',
+    kind: 'provider' | 'resource',
+  ): Promise<{
+    outcomes: string[];
+    deadlocks: number;
+    contradictions: ClaimContradictions;
+    serviceId: string;
+    footprint: number;
+  }> {
+    const pool = getPool();
+    const booking = await makeBooking({
+      branchId: fx.branchA,
+      isoDate: DATE,
+      hour: 12,
+      serviceId: fx.service,
+      customerId: fx.customerOne,
+    });
+
+    const first = await pool.connect();
+    const second = await pool.connect();
+    const run = (client: typeof first, what: 'claim' | 'service'): Promise<string> =>
+      (what === 'service'
+        ? client.query('UPDATE bookings SET service_id = $2 WHERE id = $1', [
+            booking,
+            fx.otherService,
+          ])
+        : kind === 'provider'
+          ? client.query(
+              `INSERT INTO booking_provider_allocations
+                 (booking_id, branch_id, employee_id, b_starts_at, b_ends_at, b_buf_before, b_buf_after)
+               SELECT b.id, b.branch_id, $2, b.starts_at, b.ends_at,
+                      b.buffer_before_min_snapshot, b.buffer_after_min_snapshot
+               FROM bookings b WHERE b.id = $1`,
+              [booking, fx.staffA.id],
+            )
+          : client.query(
+              `INSERT INTO booking_resource_allocations
+                 (booking_id, branch_id, resource_id, resource_type_id,
+                  b_starts_at, b_ends_at, b_buf_before, b_buf_after)
+               SELECT b.id, b.branch_id, $2, $3, b.starts_at, b.ends_at,
+                      b.buffer_before_min_snapshot, b.buffer_after_min_snapshot
+               FROM bookings b WHERE b.id = $1`,
+              [booking, fx.chairA1, fx.chairTypeId],
+            )
+      ).then(
+        () => 'applied',
+        (error: { code?: string }) => error.code ?? 'unknown',
+      );
+
+    const outcomes: string[] = [];
+    try {
+      const secondPid = await backendPid(second);
+      const [a, b] =
+        order === 'claim-first' ? (['claim', 'service'] as const) : (['service', 'claim'] as const);
+      await first.query('BEGIN');
+      outcomes.push(await run(first, a));
+      await second.query('BEGIN');
+      const pending = run(second, b);
+      // Deterministic barrier — never a sleep.
+      await waitUntilBlockedBy(pool, secondPid, 5_000);
+      await first.query(outcomes[0] === 'applied' ? 'COMMIT' : 'ROLLBACK');
+      const secondOutcome = await pending;
+      outcomes.push(secondOutcome);
+      await second.query(secondOutcome === 'applied' ? 'COMMIT' : 'ROLLBACK').catch(() => undefined);
+    } finally {
+      first.release();
+      second.release();
+    }
+
+    const row = await pool.query<{ service_id: string; footprint: number }>(
+      `SELECT b.service_id,
+              (SELECT count(*)::int FROM booking_provider_allocations WHERE booking_id = b.id)
+            + (SELECT count(*)::int FROM booking_resource_allocations WHERE booking_id = b.id) AS footprint
+       FROM bookings b WHERE b.id = $1`,
+      [booking],
+    );
+    return {
+      outcomes,
+      deadlocks: outcomes.filter((o) => o === '40P01').length,
+      contradictions: await claimContradictions(pool),
+      serviceId: row.rows[0]!.service_id,
+      footprint: row.rows[0]!.footprint,
+    };
+  }
+
+  for (const kind of ['provider', 'resource'] as const) {
+    it(`[C2-service] the ${kind} claim commits first: the service change is refused`, async () => {
+      const result = await serviceChangeVersusClaim('claim-first', kind);
+      expect(result.outcomes[0]).toBe('applied');
+      expect(result.outcomes[1]).toBe('P0001');
+      // No half-applied booking: it kept its service and kept its claim.
+      expect(result.serviceId).toBe(fx.service);
+      expect(result.footprint).toBe(1);
+      expect(result.contradictions).toEqual(NO_CONTRADICTIONS);
+      expect(result.deadlocks).toBe(0);
+    }, 30_000);
+  }
+
+  it('[C2-service] the service change commits first: the provider claim validates the NEW service', async () => {
+    const result = await serviceChangeVersusClaim('service-first', 'provider');
+    // The change was legitimate — at that moment the booking carried nothing.
+    expect(result.outcomes[0]).toBe('applied');
+    // ...and the claim that follows is judged against the service the booking
+    // now names, not the one it named when the statement was written.
+    expect(result.outcomes[1]).toBe('P0001');
+    expect(result.serviceId).toBe(fx.otherService);
+    expect(result.footprint).toBe(0);
+    expect(result.contradictions).toEqual(NO_CONTRADICTIONS);
+    expect(result.deadlocks).toBe(0);
+  }, 30_000);
+
+  it('[C2-service] the service change commits first: a resource claim is accepted, and that is correct', async () => {
+    const result = await serviceChangeVersusClaim('service-first', 'resource');
+    expect(result.outcomes[0]).toBe('applied');
+    // Stated plainly rather than wished away: a resource claim carries NO
+    // service-specific eligibility of its own. What ties units to a service is
+    // the sealed requirement snapshot — and a booking that has one cannot
+    // change service at all, which is the other half of this pair of tests. So
+    // the correct outcome here is a chair held for a booking that had no
+    // footprint when its service moved. Nothing is contradictory.
+    expect(result.outcomes[1]).toBe('applied');
+    expect(result.serviceId).toBe(fx.otherService);
+    expect(result.footprint).toBe(1);
+    expect(result.contradictions).toEqual(NO_CONTRADICTIONS);
     expect(result.deadlocks).toBe(0);
   }, 30_000);
 

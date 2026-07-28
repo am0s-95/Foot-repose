@@ -6,11 +6,15 @@ import {
   captureBookingRequirements,
   findBookingById,
   reassignProvider,
+  releaseBookingAllocations,
 } from '@foot-repose/db';
 import { closePool, getPool } from '../src/lib/pool';
 import {
   allocationErrorOf,
+  claimContradictions,
+  footprintSnapshot,
   makeBooking,
+  NO_CONTRADICTIONS,
   replaceOffering,
   setupAllocationFixtures,
   sqlstateOf,
@@ -392,6 +396,168 @@ describe('what PostgreSQL refuses', () => {
     });
   });
 
+  /**
+   * [C2-service] The third way a live claim can be invalidated: not the
+   * evidence, not the claim, but the BOOKING's own determinant.
+   *
+   * `service_id` is not part of the composite key the claims carry, so changing
+   * it cascades nothing and fires no allocation trigger. Every test here goes
+   * through raw SQL on purpose — a repository-level rule would not be an answer.
+   */
+  describe('a service change must not orphan a live claim [C2-service]', () => {
+    const changeService = (bookingId: string, serviceId?: string): Promise<string> =>
+      sqlstateOf(() =>
+        getPool().query('UPDATE bookings SET service_id = $2 WHERE id = $1', [
+          bookingId,
+          serviceId ?? fx.otherService,
+        ]),
+      );
+
+    const allocated = async (): Promise<string> => {
+      const id = await book({ hour: 10 });
+      await captureBookingRequirements(getPool(), id);
+      await allocateBooking(getPool(), id, {
+        employeeId: fx.staffA.id,
+        resourceIds: [fx.chairA1],
+      });
+      return id;
+    };
+
+    it('refuses the change while a claim is live, and changes NOTHING', async () => {
+      const booking = await allocated();
+      const before = await footprintSnapshot(getPool(), booking);
+      expect(await changeService(booking)).toBe('P0001');
+      // Byte for byte: the booking row, both allocation tables, the requirement
+      // set and its children.
+      expect(await footprintSnapshot(getPool(), booking)).toBe(before);
+      expect(await claimContradictions(getPool())).toEqual(NO_CONTRADICTIONS);
+    });
+
+    it('names the footprint it refused over', async () => {
+      const booking = await allocated();
+      let message = '';
+      try {
+        await getPool().query('UPDATE bookings SET service_id = $2 WHERE id = $1', [
+          booking,
+          fx.otherService,
+        ]);
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toContain('live provider claims 1');
+      expect(message).toContain('live resource claims 1');
+      expect(message).toContain('requirement snapshots 1');
+    });
+
+    it('accepts assigning the SAME service to itself — semantic distinctness', async () => {
+      const booking = await allocated();
+      expect(await changeService(booking, fx.service)).toBe('no error');
+      expect(await claimContradictions(getPool())).toEqual(NO_CONTRADICTIONS);
+    });
+
+    it('accepts the change on a booking with no scheduling footprint at all', async () => {
+      const booking = await book({ hour: 14 });
+      expect(await changeService(booking)).toBe('no error');
+      const row = await getPool().query<{ service_id: string }>(
+        'SELECT service_id FROM bookings WHERE id = $1',
+        [booking],
+      );
+      expect(row.rows[0]!.service_id).toBe(fx.otherService);
+      expect(await claimContradictions(getPool())).toEqual(NO_CONTRADICTIONS);
+    });
+
+    it('STILL refuses once every live claim is released: history names no service of its own', async () => {
+      const booking = await allocated();
+      await releaseBookingAllocations(getPool(), booking, 'test');
+      const live = await getPool().query<{ n: number }>(
+        `SELECT (SELECT count(*)::int FROM booking_provider_allocations
+                  WHERE booking_id = $1 AND released_at IS NULL)
+              + (SELECT count(*)::int FROM booking_resource_allocations
+                  WHERE booking_id = $1 AND released_at IS NULL) AS n`,
+        [booking],
+      );
+      expect(live.rows[0]!.n).toBe(0);
+      // A released row records "this employee held this window for this
+      // booking". Re-pointing the booking would make it read as if the NEW
+      // service had been performed, so the release does not unlock the change.
+      const before = await footprintSnapshot(getPool(), booking);
+      expect(await changeService(booking)).toBe('P0001');
+      expect(await footprintSnapshot(getPool(), booking)).toBe(before);
+      expect(await claimContradictions(getPool())).toEqual(NO_CONTRADICTIONS);
+    });
+
+    it('refuses when a resource claim alone is live, and when a snapshot alone exists', async () => {
+      // Resource claim only — no provider claim anywhere near it.
+      const resourceOnly = await book({ hour: 16 });
+      await getPool().query(
+        `INSERT INTO booking_resource_allocations
+           (booking_id, branch_id, resource_id, resource_type_id,
+            b_starts_at, b_ends_at, b_buf_before, b_buf_after)
+         SELECT b.id, b.branch_id, $2, $3, b.starts_at, b.ends_at,
+                b.buffer_before_min_snapshot, b.buffer_after_min_snapshot
+         FROM bookings b WHERE b.id = $1`,
+        [resourceOnly, fx.chairA1, fx.chairTypeId],
+      );
+      const beforeResource = await footprintSnapshot(getPool(), resourceOnly);
+      expect(await changeService(resourceOnly)).toBe('P0001');
+      expect(await footprintSnapshot(getPool(), resourceOnly)).toBe(beforeResource);
+
+      // Requirement snapshot only — nothing is claimed yet. The composite FK
+      // would refuse this one too (23503); the guard reaches it first and says
+      // why, which is the whole reason it is worth having.
+      const snapshotOnly = await book({ hour: 18 });
+      await captureBookingRequirements(getPool(), snapshotOnly);
+      const beforeSnapshot = await footprintSnapshot(getPool(), snapshotOnly);
+      expect(await changeService(snapshotOnly)).toBe('P0001');
+      expect(await footprintSnapshot(getPool(), snapshotOnly)).toBe(beforeSnapshot);
+
+      expect(await claimContradictions(getPool())).toEqual(NO_CONTRADICTIONS);
+    });
+
+    it('refuses to leave a cancelled booking holding capacity, and keeps the controlled path working', async () => {
+      const booking = await allocated();
+      // Raw SQL, one transaction, no release: refused at COMMIT because the
+      // check is deferred — which is what lets the controlled path below set the
+      // status first and release second inside ONE transaction.
+      const client = await getPool().connect();
+      let outcome = 'no error';
+      try {
+        await client.query('BEGIN');
+        await client.query("UPDATE bookings SET status = 'cancelled' WHERE id = $1", [booking]);
+        await client.query('COMMIT');
+      } catch (error) {
+        outcome = (error as { code?: string }).code ?? 'unknown';
+        await client.query('ROLLBACK').catch(() => undefined);
+      } finally {
+        client.release();
+      }
+      expect(outcome).toBe('P0001');
+      expect(await claimContradictions(getPool())).toEqual(NO_CONTRADICTIONS);
+
+      const transition = await applyBookingTransition(getPool(), booking, 'confirmed', 'cancelled');
+      expect(transition.ok).toBe(true);
+      expect(await liveProvider(booking)).toBeNull();
+      expect(await claimContradictions(getPool())).toEqual(NO_CONTRADICTIONS);
+    });
+
+    it('refuses to attach a live claim to a booking that already stopped holding', async () => {
+      const cancelled = await book({ hour: 20, status: 'cancelled' });
+      expect(
+        await sqlstateOf(() =>
+          getPool().query(
+            `INSERT INTO booking_provider_allocations
+               (booking_id, branch_id, employee_id, b_starts_at, b_ends_at, b_buf_before, b_buf_after)
+             SELECT b.id, b.branch_id, $2, b.starts_at, b.ends_at,
+                    b.buffer_before_min_snapshot, b.buffer_after_min_snapshot
+             FROM bookings b WHERE b.id = $1`,
+            [cancelled, fx.staffA.id],
+          ),
+        ),
+      ).toBe('P0001');
+      expect(await claimContradictions(getPool())).toEqual(NO_CONTRADICTIONS);
+    });
+  });
+
   it('[+1] derives the same occupancy in SQL and in the domain', async () => {
     const cases = [
       { hour: 10, minute: 0, durationMin: 45, bufferBeforeMin: 0, bufferAfterMin: 10 },
@@ -431,7 +597,9 @@ describe('what PostgreSQL refuses', () => {
       });
       expect(row.rows[0]!.lo.toISOString()).toBe(expected.startUtc.toISOString());
       expect(row.rows[0]!.hi.toISOString()).toBe(expected.endUtc.toISOString());
-      await getPool().query('UPDATE bookings SET status = $2 WHERE id = $1', [id, 'cancelled']);
+      // Release BEFORE cancelling: since 0006 a booking may not be left in a
+      // non-holding status while it still holds capacity, and these two
+      // statements are two separate transactions.
       await getPool().query(
         `UPDATE booking_provider_allocations SET released_at = now(), release_reason = 'test'
          WHERE booking_id = $1 AND released_at IS NULL`,
@@ -442,6 +610,7 @@ describe('what PostgreSQL refuses', () => {
          WHERE booking_id = $1 AND released_at IS NULL`,
         [id],
       );
+      await getPool().query('UPDATE bookings SET status = $2 WHERE id = $1', [id, 'cancelled']);
     }
   });
 });
