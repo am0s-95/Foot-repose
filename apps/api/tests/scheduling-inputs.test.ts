@@ -468,10 +468,19 @@ describe('provider scheduling (T5-T8)', () => {
       await expect(addBreak(fx.branchA, '2030-01-01', '2030-03-01')).resolves.toBeTypeOf('string');
     });
 
-    it('rejects a one-day hole between two shift versions', async () => {
-      await addShift(fx.branchA, '2030-01-01', '2030-02-01');
-      await addShift(fx.branchA, '2030-02-02', '2030-03-01'); // 2030-02-01 is missing
+    it('rejects a one-day hole on a day the break actually occurs', async () => {
+      // 2030-02-03 is a Sunday, and the break occurs on Sundays.
+      await addShift(fx.branchA, '2030-01-01', '2030-02-03');
+      await addShift(fx.branchA, '2030-02-04', '2030-03-01');
       await expect(addBreak(fx.branchA, '2030-01-01', '2030-03-01')).rejects.toThrow(NOT_COVERED);
+    });
+
+    it('accepts a hole on a weekday the break never occurs on', async () => {
+      // 2030-02-01 is a Friday: the Sunday break has no occurrence there, so
+      // the gap leaves nothing uncovered. Coverage is about occurrences.
+      await addShift(fx.branchA, '2030-01-01', '2030-02-01');
+      await addShift(fx.branchA, '2030-02-02', '2030-03-01');
+      await expect(addBreak(fx.branchA, '2030-01-01', '2030-03-01')).resolves.toBeTypeOf('string');
     });
 
     it('accepts two adjacent shift versions that jointly span the break', async () => {
@@ -491,6 +500,38 @@ describe('provider scheduling (T5-T8)', () => {
       await addShift(fx.branchA, VALID_FROM, null, 6, 1380, 1560); // Sat 23:00 -> 02:00
       await expect(addBreak(fx.branchA, VALID_FROM, null, 0, 30, 60)).resolves.toBeTypeOf('string');
       await expect(addBreak(fx.branchA, VALID_FROM, null, 0, 90, 150)).rejects.toThrow(NOT_COVERED);
+    });
+
+    // 2030-01-06 is a Sunday; 2030-01-05 the Saturday before it. A night shift
+    // is ANCHORED on the day it starts, so the version that has to be in force
+    // is the one covering that Saturday — not merely the Sunday the minutes
+    // land on.
+    const SUN = '2030-01-06';
+    const SAT = '2030-01-05';
+
+    it('refuses a break justified only by an occurrence the version was too young to produce', async () => {
+      await addShift(fx.branchA, SUN, null, 6, 1380, 1560); // version begins ON the Sunday
+      await expect(addBreak(fx.branchA, SUN, null, 0, 30, 60)).rejects.toThrow(NOT_COVERED);
+      // and nothing was written
+      const left = await getPool().query<{ n: number }>(
+        "SELECT count(*)::int AS n FROM provider_weekly_windows WHERE kind = 'break'",
+      );
+      expect(left.rows[0]!.n).toBe(0);
+    });
+
+    it('accepts the same break once the shift version covers the anchor day', async () => {
+      await addShift(fx.branchA, SAT, null, 6, 1380, 1560);
+      await expect(addBreak(fx.branchA, SUN, null, 0, 30, 60)).resolves.toBeTypeOf('string');
+      const stored = await getPool().query<{ n: number }>(
+        "SELECT count(*)::int AS n FROM provider_weekly_windows WHERE kind = 'break'",
+      );
+      expect(stored.rows[0]!.n).toBe(1);
+    });
+
+    it('still refuses the anchored night shift when it belongs to another branch', async () => {
+      await addShift(fx.branchB, SAT, null, 6, 1380, 1560);
+      await expect(addBreak(fx.branchA, SUN, null, 0, 30, 60)).rejects.toThrow(NOT_COVERED);
+      await expect(addBreak(fx.branchB, SUN, null, 0, 30, 60)).resolves.toBeTypeOf('string');
     });
   });
 

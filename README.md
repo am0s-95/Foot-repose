@@ -133,12 +133,18 @@ both directions:
   appearing available in two branches at the same instant while leaving no
   gap in total coverage.
 
-A break must be covered by that provider's shifts **in the same branch**, for
-every date of its validity and every minute of its week geometry — overlapping
-date ranges are not coverage, and two adjacent shift versions may cover a break
-jointly. That containment crosses rows of a single table over two dimensions,
-so it is validated in the write path (`insertProviderWeeklyWindow`) and
-re-proved over the seed by anti-join. It is a repository guarantee, not a
+A break must be covered by that provider's shifts **in the same branch**,
+occurrence by occurrence. Coverage is decided on the windows the schedule
+really produces — with the same function materialisation uses — not on abstract
+week geometry: overlapping date ranges are not coverage, two adjacent shift
+versions may cover a break jointly, and an occurrence that runs past midnight
+belongs to the day it **started** on, so the version that must be in force is
+the one covering that anchor day (for every weekday transition, not only
+Saturday→Sunday). A Saturday 23:00→Sunday 02:00 shift whose version begins on
+the Sunday produces no Sunday-morning occurrence at all, and cannot justify a
+break there. That containment crosses rows of a single table over two
+dimensions, so it is validated in the write path
+(`insertProviderWeeklyWindow`) and re-proved over the seed by anti-join. It is a repository guarantee, not a
 constraint: this slice exposes no update or delete path for weekly windows, but
 direct SQL shortening a shift would strand a break and nothing in the database
 stops that. The failure direction is safe — a stranded break only ever removes

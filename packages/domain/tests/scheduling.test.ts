@@ -13,7 +13,7 @@ import {
   type UtcInterval,
   type WeeklyWindow,
 } from '../src/scheduling';
-import { muscatDateTimeToUtc } from '../src/time';
+import { addDaysToIsoDate, muscatDateTimeToUtc } from '../src/time';
 
 // Calendar anchors used throughout: 2026-08-29 is a Saturday, so
 // 2026-08-30 is the Sunday that starts the next week.
@@ -270,12 +270,27 @@ describe('break coverage over time AND dates', () => {
     expect(breakIsCoveredByShifts(breakAt({ validFrom: '2029-12-01', validTo: '2030-02-01' }), [shift])).toBe(false);
   });
 
-  it('rejects a one-day hole in the middle of the break range', () => {
-    const first = shiftAt({ validFrom: '2030-01-01', validTo: '2030-02-01' });
-    const second = shiftAt({ validFrom: '2030-02-02', validTo: '2030-03-01' }); // 2030-02-01 missing
+  it('rejects a one-day hole that falls on a day the break actually occurs', () => {
+    // 2030-02-03 is a Sunday, and the break occurs on Sundays — so a version
+    // gap on exactly that day leaves a real occurrence uncovered.
+    const first = shiftAt({ validFrom: '2030-01-01', validTo: '2030-02-03' });
+    const second = shiftAt({ validFrom: '2030-02-04', validTo: '2030-03-01' });
+    expect(muscatDayOfWeek('2030-02-03')).toBe(0);
     expect(
       breakIsCoveredByShifts(breakAt({ validFrom: '2030-01-01', validTo: '2030-03-01' }), [first, second]),
     ).toBe(false);
+  });
+
+  it('accepts a hole on a weekday the break never occurs on', () => {
+    // 2030-02-01 is a Friday. The break only ever happens on Sundays, so this
+    // gap leaves no occurrence uncovered — coverage is about occurrences, not
+    // about calendar arithmetic on the version ranges.
+    expect(muscatDayOfWeek('2030-02-01')).toBe(5);
+    const first = shiftAt({ validFrom: '2030-01-01', validTo: '2030-02-01' });
+    const second = shiftAt({ validFrom: '2030-02-02', validTo: '2030-03-01' });
+    expect(
+      breakIsCoveredByShifts(breakAt({ validFrom: '2030-01-01', validTo: '2030-03-01' }), [first, second]),
+    ).toBe(true);
   });
 
   it('accepts two adjacent shift versions that jointly span the break', () => {
@@ -315,7 +330,143 @@ describe('break coverage over time AND dates', () => {
       validTo: '2030-03-01',
     });
     const wrapBreak = breakAt({ dayOfWeek: 0, openMinute: 30, closeMinute: 60 });
+    // Last Sunday inside the shift version is 2030-02-24; the next one,
+    // 2030-03-03, is past its end.
+    expect(muscatDayOfWeek('2030-03-03')).toBe(0);
     expect(breakIsCoveredByShifts({ ...wrapBreak, validTo: '2030-03-01' }, [nightShift])).toBe(true);
-    expect(breakIsCoveredByShifts({ ...wrapBreak, validTo: '2030-03-02' }, [nightShift])).toBe(false);
+    expect(breakIsCoveredByShifts({ ...wrapBreak, validTo: '2030-03-04' }, [nightShift])).toBe(false);
+  });
+
+  // ---------------------------------------------------------------- midnight
+  // An occurrence that runs past midnight is ANCHORED on the day it started.
+  // The version that has to be in force is the one covering that anchor day —
+  // not merely the day the minutes land on.
+  describe('a version boundary in the middle of the night', () => {
+    // 2030-01-06 is a Sunday; 2030-01-05 the Saturday before it.
+    const SUN = '2030-01-06';
+    const SAT = '2030-01-05';
+    const nightShift = (validFrom: string, validTo: string | null = null): CoverageWindow =>
+      shiftAt({ dayOfWeek: 6, openMinute: 1380, closeMinute: 1560, validFrom, validTo });
+    const morningBreak = breakAt({
+      dayOfWeek: 0,
+      openMinute: 30,
+      closeMinute: 60,
+      validFrom: SUN,
+      validTo: null,
+    });
+
+    it('rejects a break justified only by an occurrence its version was too young to produce', () => {
+      // Template says Saturday 23:00 -> Sunday 02:00, but the version only
+      // begins on the Sunday: no Saturday anchor, so no Sunday-morning
+      // occurrence exists at all.
+      expect(breakIsCoveredByShifts(morningBreak, [nightShift(SUN)])).toBe(false);
+      // Proof that the rejection matches reality, from the materialiser:
+      expect(
+        materializeProviderPresence({
+          isoDate: SUN,
+          weekly: [{ ...nightShift(SUN), branchId: BRANCH_A, kind: 'shift' as const }],
+          extraShifts: [],
+        }),
+      ).toEqual([]);
+    });
+
+    it('accepts the same break once the version covers the anchor day', () => {
+      expect(breakIsCoveredByShifts(morningBreak, [nightShift(SAT)])).toBe(true);
+      expect(breakIsCoveredByShifts(morningBreak, [nightShift('2030-01-04')])).toBe(true);
+      expect(
+        shape(
+          materializeProviderPresence({
+            isoDate: SUN,
+            weekly: [{ ...nightShift(SAT), branchId: BRANCH_A, kind: 'shift' as const }],
+            extraShifts: [],
+          }),
+        ),
+      ).toEqual([`${at(SUN, 0)}..${at(SUN, 2)}`]);
+    });
+
+    it('needs the version to still be in force on the day the minutes land, too', () => {
+      // One single occurrence to reason about: the break lives on 2030-01-06.
+      const oneSunday = { ...morningBreak, validTo: '2030-01-07' };
+      // Anchored on Saturday 2030-01-05 but ending exactly on the Sunday: the
+      // occurrence would spill into a day this version no longer owns, so the
+      // materialiser produces nothing and the break is refused.
+      expect(breakIsCoveredByShifts(oneSunday, [nightShift(SAT, SUN)])).toBe(false);
+      expect(breakIsCoveredByShifts(oneSunday, [nightShift(SAT, '2030-01-07')])).toBe(true);
+      // An open-ended break, by contrast, still needs every LATER Sunday
+      // covered — a version that stops on 2030-01-07 cannot do that.
+      expect(breakIsCoveredByShifts(morningBreak, [nightShift(SAT, '2030-01-07')])).toBe(false);
+    });
+
+    it('holds for every weekday transition, not just Saturday to Sunday', () => {
+      const results = Array.from({ length: 7 }, (_, anchorDow) => {
+        const landingDow = (anchorDow + 1) % 7;
+        const landingDate = addDaysToIsoDate(SUN, landingDow); // 2030-01-06 is dow 0
+        const anchorDate = addDaysToIsoDate(landingDate, -1);
+        expect([muscatDayOfWeek(anchorDate), muscatDayOfWeek(landingDate)]).toEqual([
+          anchorDow,
+          landingDow,
+        ]);
+        const night = (validFrom: string): CoverageWindow =>
+          shiftAt({ dayOfWeek: anchorDow, openMinute: 1380, closeMinute: 1560, validFrom });
+        const brk = breakAt({
+          dayOfWeek: landingDow,
+          openMinute: 30,
+          closeMinute: 60,
+          validFrom: landingDate,
+          validTo: null,
+        });
+        return (
+          `${anchorDow}->${landingDow}` +
+          ` version-from-landing-day=${breakIsCoveredByShifts(brk, [night(landingDate)])}` +
+          ` version-from-anchor-day=${breakIsCoveredByShifts(brk, [night(anchorDate)])}`
+        );
+      });
+      expect(results).toEqual([
+        '0->1 version-from-landing-day=false version-from-anchor-day=true',
+        '1->2 version-from-landing-day=false version-from-anchor-day=true',
+        '2->3 version-from-landing-day=false version-from-anchor-day=true',
+        '3->4 version-from-landing-day=false version-from-anchor-day=true',
+        '4->5 version-from-landing-day=false version-from-anchor-day=true',
+        '5->6 version-from-landing-day=false version-from-anchor-day=true',
+        '6->0 version-from-landing-day=false version-from-anchor-day=true',
+      ]);
+    });
+
+    it('handles a break that itself crosses midnight', () => {
+      const wrapBreak = breakAt({
+        dayOfWeek: 6,
+        openMinute: 1410,
+        closeMinute: 1500, // Sat 23:30 -> Sun 01:00
+        validFrom: SAT,
+        validTo: null,
+      });
+      // A shift anchored on the same Saturday, wide enough for both halves.
+      expect(
+        breakIsCoveredByShifts(wrapBreak, [
+          shiftAt({ dayOfWeek: 6, openMinute: 1380, closeMinute: 1560, validFrom: SAT }),
+        ]),
+      ).toBe(true);
+      // Same shift, but its version starts on the Sunday: neither half exists.
+      expect(
+        breakIsCoveredByShifts(wrapBreak, [
+          shiftAt({ dayOfWeek: 6, openMinute: 1380, closeMinute: 1560, validFrom: SUN }),
+        ]),
+      ).toBe(false);
+    });
+
+    it('lets two shifts cover an after-midnight break jointly, and catches the gap', () => {
+      const brk = breakAt({
+        dayOfWeek: 0,
+        openMinute: 60,
+        closeMinute: 150, // Sunday 01:00 -> 02:30
+        validFrom: SUN,
+        validTo: null,
+      });
+      const night = shiftAt({ dayOfWeek: 6, openMinute: 1380, closeMinute: 1560, validFrom: SAT }); // Sun 00:00-02:00
+      const morning = shiftAt({ dayOfWeek: 0, openMinute: 120, closeMinute: 300, validFrom: SUN }); // Sun 02:00-05:00
+      expect(breakIsCoveredByShifts(brk, [night, morning])).toBe(true);
+      const gapped = shiftAt({ dayOfWeek: 0, openMinute: 130, closeMinute: 300, validFrom: SUN });
+      expect(breakIsCoveredByShifts(brk, [night, gapped])).toBe(false);
+    });
   });
 });

@@ -157,23 +157,51 @@ export interface CoverageWindow extends DatedVersion {
 }
 
 /**
- * Is EVERY date of `breakWindow.validDates` covered by shifts that also cover
- * every minute of its week geometry?
+ * Dates whose OCCURRENCES have to be examined to decide coverage for good.
  *
- * Overlapping date ranges are not enough: a shift version ending in February
- * does not justify a break that runs past February. The check therefore walks
- * the break's date range segment by segment — cut at every shift version
- * boundary — and on each segment asks whether the UNION of the shifts in
- * force there covers the break's week spans. Two adjacent shift versions that
- * jointly span the break's dates are accepted; a one-day gap is not.
+ * Between two version boundaries the set of versions in force never changes,
+ * so `occurrencesOnDate` there depends on nothing but the weekday and repeats
+ * with a period of one week. Probing each boundary's neighbourhood — the day
+ * before it (an occurrence anchored there can reach across midnight into the
+ * boundary day) through a full week after it — therefore visits every distinct
+ * situation that exists, without ever walking an unbounded range day by day.
+ */
+function coverageProbeDates(breakWindow: CoverageWindow, shifts: CoverageWindow[]): string[] {
+  const anchors = new Set<string>();
+  for (const date of [
+    breakWindow.validFrom,
+    breakWindow.validTo,
+    ...shifts.flatMap((s) => [s.validFrom, s.validTo]),
+  ]) {
+    if (date !== null) anchors.add(date);
+  }
+  const probes = new Set<string>();
+  for (const anchor of anchors) {
+    for (let offset = -1; offset <= 7; offset += 1) probes.add(addDaysToIsoDate(anchor, offset));
+  }
+  return [...probes].sort();
+}
+
+/**
+ * Is every OCCURRENCE of `breakWindow` covered by occurrences of `shifts`?
+ *
+ * This asks the question in terms of the windows the schedule really produces,
+ * not of abstract week geometry, and it answers it with the very same function
+ * materialisation uses (`templateSpansForDate`). The two can therefore never
+ * disagree.
+ *
+ * Why that matters: a shift template of Saturday 23:00 -> Sunday 02:00 whose
+ * version only starts on the Sunday produces NO Sunday-morning occurrence at
+ * all — the occurrence it would have belonged to is anchored on the Saturday,
+ * and the version did not exist yet. Week geometry alone says "Sunday 00:00 to
+ * 02:00 is inside this shift" and would wrongly accept a break there. Coverage
+ * is decided per Muscat date, with the after-midnight part of an occurrence
+ * charged to the day the occurrence STARTED on, for every weekday transition —
+ * not just Saturday to Sunday.
  *
  * A break belongs to its branch: a shift of the same provider in a DIFFERENT
- * branch never justifies it. Shifts carrying a branch that differs from the
- * break's are dropped before the geometry is considered.
- *
- * The geometry is `weekSpansOf` — the same decomposition the database's
- * generated `week_spans` column uses — so midnight crossings and the
- * Saturday -> Sunday wrap behave identically here and in the constraints.
+ * branch never justifies it, so those are dropped before anything else.
+ * Several shifts may cover a break jointly, as long as no minute is left over.
  *
  * Fail-safe by design: a break that ends up outside a shift only ever REMOVES
  * availability, which is why this is a write-path check rather than a
@@ -183,30 +211,16 @@ export function breakIsCoveredByShifts(
   breakWindow: CoverageWindow,
   shifts: CoverageWindow[],
 ): boolean {
-  const from = breakWindow.validFrom;
-  const to = breakWindow.validTo;
   const sameBranch = shifts.filter(
     (s) =>
       s.branchId === undefined ||
       breakWindow.branchId === undefined ||
       s.branchId === breakWindow.branchId,
   );
-  const insideBreak = (date: string): boolean => date > from && (to === null || date < to);
-  // One segment per stretch of dates over which the set of shift versions in
-  // force does not change.
-  const starts = [
-    from,
-    ...new Set(
-      sameBranch
-        .flatMap((s) => [s.validFrom, s.validTo])
-        .filter((date): date is string => date !== null && insideBreak(date)),
-    ),
-  ].sort();
-
-  const target = weekSpansOf(breakWindow);
-  for (const start of starts) {
-    const inForce = sameBranch.filter((s) => versionCoversDate(s, start));
-    if (!covers(inForce.flatMap(weekSpansOf), target)) return false;
+  for (const date of coverageProbeDates(breakWindow, sameBranch)) {
+    const needed = templateSpansForDate(date, [breakWindow]);
+    if (needed.length === 0) continue;
+    if (!covers(templateSpansForDate(date, sameBranch), needed)) return false;
   }
   return true;
 }

@@ -59,24 +59,78 @@ describe('seed invariants', () => {
    * that could never fail cannot pass for a guarantee.
    */
   const INVARIANTS = {
-    // Overlap is not coverage: every DATE of a break must sit inside the union
-    // of that provider's shift versions IN THE SAME BRANCH whose week geometry
-    // contains the break's.
+    /**
+     * Occurrence-level coverage, the same rule `breakIsCoveredByShifts`
+     * applies — not `week_spans @>` and not overlapping `valid_dates`, both of
+     * which accept a break justified by an occurrence that never happens.
+     *
+     * For every probe date (each version boundary of the break or of that
+     * provider's shifts in that branch, from the day before it through a full
+     * week after — beyond which the picture repeats weekly) it materialises:
+     *   * the minutes the BREAK really occupies that Muscat day: its own
+     *     weekday part, plus the after-midnight remainder of an occurrence
+     *     ANCHORED on the previous day — which counts only when the version
+     *     was in force on that anchor day AND is still in force on this one;
+     *   * the same for every SHIFT of that provider in that branch, unioned.
+     * A break minute with no shift minute under it is a violation.
+     */
     uncoveredBreaks: `
+      WITH b AS (
+        SELECT id, employee_id, branch_id, valid_dates, day_of_week, open_minute, close_minute
+        FROM provider_weekly_windows WHERE kind = 'break'
+      ),
+      probe AS (
+        SELECT DISTINCT b.id AS break_id, (a.d + off)::date AS on_date
+        FROM b
+        CROSS JOIN LATERAL (
+          SELECT lower(b.valid_dates) AS d
+          UNION SELECT upper(b.valid_dates)
+          UNION SELECT lower(s.valid_dates) FROM provider_weekly_windows s
+            WHERE s.kind = 'shift' AND s.employee_id = b.employee_id AND s.branch_id = b.branch_id
+          UNION SELECT upper(s.valid_dates) FROM provider_weekly_windows s
+            WHERE s.kind = 'shift' AND s.employee_id = b.employee_id AND s.branch_id = b.branch_id
+        ) a
+        CROSS JOIN generate_series(-1, 7) AS off
+        WHERE a.d IS NOT NULL
+      ),
+      needed AS (
+        SELECT p.break_id, p.on_date, range_agg(part.r) AS spans
+        FROM probe p JOIN b ON b.id = p.break_id
+        CROSS JOIN LATERAL (
+          SELECT int4range(b.open_minute, least(b.close_minute, 1440)) AS r
+           WHERE b.day_of_week = extract(dow FROM p.on_date)::int
+             AND b.valid_dates @> p.on_date
+          UNION ALL
+          SELECT int4range(0, b.close_minute - 1440)
+           WHERE b.close_minute > 1440
+             AND b.day_of_week = extract(dow FROM p.on_date - 1)::int
+             AND b.valid_dates @> (p.on_date - 1)
+             AND b.valid_dates @> p.on_date
+        ) part
+        GROUP BY 1, 2
+      ),
+      available AS (
+        SELECT n.break_id, n.on_date, range_agg(part.r) AS spans
+        FROM needed n JOIN b ON b.id = n.break_id
+        JOIN provider_weekly_windows s
+          ON s.kind = 'shift' AND s.employee_id = b.employee_id AND s.branch_id = b.branch_id
+        CROSS JOIN LATERAL (
+          SELECT int4range(s.open_minute, least(s.close_minute, 1440)) AS r
+           WHERE s.day_of_week = extract(dow FROM n.on_date)::int
+             AND s.valid_dates @> n.on_date
+          UNION ALL
+          SELECT int4range(0, s.close_minute - 1440)
+           WHERE s.close_minute > 1440
+             AND s.day_of_week = extract(dow FROM n.on_date - 1)::int
+             AND s.valid_dates @> (n.on_date - 1)
+             AND s.valid_dates @> n.on_date
+        ) part
+        GROUP BY 1, 2
+      )
       SELECT count(*)::int AS n
-      FROM provider_weekly_windows b
-      WHERE b.kind = 'break'
-        AND NOT (
-          coalesce(
-            (SELECT range_agg(s.valid_dates)
-               FROM provider_weekly_windows s
-              WHERE s.kind = 'shift'
-                AND s.employee_id = b.employee_id
-                AND s.branch_id = b.branch_id
-                AND s.week_spans @> b.week_spans),
-            '{}'::datemultirange
-          ) @> b.valid_dates
-        )`,
+      FROM needed n
+      LEFT JOIN available a ON a.break_id = n.break_id AND a.on_date = n.on_date
+      WHERE NOT (coalesce(a.spans, '{}'::int4multirange) @> n.spans)`,
     // Every operational assignment of a staff provider must have a real roster
     // in that branch — an assignment with no shift is a phantom.
     assignmentsWithoutRoster: `
@@ -139,6 +193,40 @@ describe('seed invariants', () => {
     }
   });
 
+  it('does not flag the legitimate counterpart of the midnight fixture', async () => {
+    // Same shapes, but the shift version starts on the SATURDAY, so the
+    // Sunday-morning occurrence really exists and the break is covered. The
+    // invariant must stay silent — it may not be stricter than the write path.
+    const pool = getPool();
+    const target = await pool.query<{ staff: string; home: string }>(
+      `SELECT w.employee_id AS staff, w.branch_id AS home
+       FROM provider_weekly_windows w WHERE w.kind = 'shift'
+       ORDER BY w.employee_id LIMIT 1`,
+    );
+    const { staff, home } = target.rows[0]!;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO provider_weekly_windows
+           (employee_id, branch_id, kind, valid_dates, day_of_week, open_minute, close_minute)
+         VALUES ('${staff}', '${home}', 'shift', daterange('2030-01-05'::date, NULL, '[)'), 6, 1380, 1560);
+         INSERT INTO provider_weekly_windows
+           (employee_id, branch_id, kind, valid_dates, day_of_week, open_minute, close_minute)
+         VALUES ('${staff}', '${home}', 'break', daterange('2030-01-06'::date, NULL, '[)'), 0, 30, 60)`,
+      );
+      const found = Number(
+        (await client.query<{ n: number }>(INVARIANTS.uncoveredBreaks)).rows[0]!.n,
+      );
+      expect(`covered-by-anchored-shift violations=${found}`).toBe(
+        'covered-by-anchored-shift violations=0',
+      );
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
+  });
+
   it('each invariant actually fires on a deliberately broken fixture', async () => {
     const pool = getPool();
     const ids = await pool.query<{ staff: string; home: string; other: string; from: string }>(
@@ -157,10 +245,16 @@ describe('seed invariants', () => {
     const { staff, home, other, from } = ids.rows[0]!;
 
     const brokenFixtures: Record<keyof typeof INVARIANTS, string> = {
-      // A Friday break in a branch where this provider never has a Friday shift.
+      // The midnight version-boundary case: a Saturday 23:00 -> Sunday 02:00
+      // shift whose version only starts on the Sunday produces no Sunday
+      // occurrence at all, so the Sunday-morning break it "justifies" is
+      // uncovered. 2030-01-06 is a Sunday.
       uncoveredBreaks: `INSERT INTO provider_weekly_windows
         (employee_id, branch_id, kind, valid_dates, day_of_week, open_minute, close_minute)
-        VALUES ('${staff}', '${home}', 'break', daterange('${from}'::date, NULL, '[)'), 5, 600, 630)`,
+        VALUES ('${staff}', '${home}', 'shift', daterange('2030-01-06'::date, NULL, '[)'), 6, 1380, 1560);
+        INSERT INTO provider_weekly_windows
+        (employee_id, branch_id, kind, valid_dates, day_of_week, open_minute, close_minute)
+        VALUES ('${staff}', '${home}', 'break', daterange('2030-01-06'::date, NULL, '[)'), 0, 30, 60)`,
       // An assignment to a branch this provider has no roster in.
       assignmentsWithoutRoster: `INSERT INTO provider_branch_assignments
         (employee_id, branch_id, valid_dates)
