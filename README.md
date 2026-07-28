@@ -133,10 +133,23 @@ both directions:
   appearing available in two branches at the same instant while leaving no
   gap in total coverage.
 
-A break must lie inside one of that provider's shifts. That containment
-crosses rows of a single table, so it is validated in the write path
-(`insertProviderWeeklyWindow`) and asserted over the seed; its failure
-direction is safe — a stray break only ever removes availability.
+A break must be covered by that provider's shifts **in the same branch**, for
+every date of its validity and every minute of its week geometry — overlapping
+date ranges are not coverage, and two adjacent shift versions may cover a break
+jointly. That containment crosses rows of a single table over two dimensions,
+so it is validated in the write path (`insertProviderWeeklyWindow`) and
+re-proved over the seed by anti-join. It is a repository guarantee, not a
+constraint: this slice exposes no update or delete path for weekly windows, but
+direct SQL shortening a shift would strand a break and nothing in the database
+stops that. The failure direction is safe — a stranded break only ever removes
+availability.
+
+Writes that touch several rows run as one unit of work on one connection
+(`withUnitOfWork`), so `saveBranchHoursOverride` is atomic even when handed a
+pool: it creates the day's header if missing, locks it `FOR UPDATE` (two
+concurrent writers therefore serialise and one caller's complete set wins), then
+deletes the old windows *before* flipping the header — the order the composite
+foreign key demands, with no constraint weakened or deferred.
 
 ## Checks
 

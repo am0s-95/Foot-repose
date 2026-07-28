@@ -415,39 +415,83 @@ describe('provider scheduling (T5-T8)', () => {
     expect(await sqlstateOf(() => qualify('2030-06-01'))).toBe('23P01');
   });
 
-  it('validates break-inside-shift in the write path', async () => {
-    const pool = getPool();
-    await insertProviderWeeklyWindow(pool, fx.staffA.id, {
-      branchId: fx.branchA,
-      kind: 'shift',
-      validFrom: VALID_FROM,
-      validTo: null,
-      dayOfWeek: 0,
-      openMinute: 600,
-      closeMinute: 1080,
+  describe('break coverage in the write path', () => {
+    const NOT_COVERED = /covered by this provider's shifts in the same branch/;
+    const addShift = (
+      branchId: string,
+      validFrom: string,
+      validTo: string | null,
+      dayOfWeek = 0,
+      openMinute = 600,
+      closeMinute = 1080,
+    ) =>
+      insertProviderWeeklyWindow(getPool(), fx.staffA.id, {
+        branchId,
+        kind: 'shift',
+        validFrom,
+        validTo,
+        dayOfWeek,
+        openMinute,
+        closeMinute,
+      });
+    const addBreak = (
+      branchId: string,
+      validFrom: string,
+      validTo: string | null,
+      dayOfWeek = 0,
+      openMinute = 780,
+      closeMinute = 810,
+    ) =>
+      insertProviderWeeklyWindow(getPool(), fx.staffA.id, {
+        branchId,
+        kind: 'break',
+        validFrom,
+        validTo,
+        dayOfWeek,
+        openMinute,
+        closeMinute,
+      });
+
+    it('accepts a break its own branch covers for every date and minute', async () => {
+      await addShift(fx.branchA, VALID_FROM, null);
+      await expect(addBreak(fx.branchA, VALID_FROM, null)).resolves.toBeTypeOf('string');
     });
-    await expect(
-      insertProviderWeeklyWindow(pool, fx.staffA.id, {
-        branchId: fx.branchA,
-        kind: 'break',
-        validFrom: VALID_FROM,
-        validTo: null,
-        dayOfWeek: 0,
-        openMinute: 1050,
-        closeMinute: 1140,
-      }),
-    ).rejects.toThrow(/inside one of the provider/);
-    await expect(
-      insertProviderWeeklyWindow(pool, fx.staffA.id, {
-        branchId: fx.branchA,
-        kind: 'break',
-        validFrom: VALID_FROM,
-        validTo: null,
-        dayOfWeek: 0,
-        openMinute: 780,
-        closeMinute: 810,
-      }),
-    ).resolves.toBeTypeOf('string');
+
+    it('rejects a break whose minutes fall outside the shift', async () => {
+      await addShift(fx.branchA, VALID_FROM, null);
+      await expect(addBreak(fx.branchA, VALID_FROM, null, 0, 1050, 1140)).rejects.toThrow(NOT_COVERED);
+    });
+
+    it('rejects a break that outlives the shift — overlap is not coverage', async () => {
+      await addShift(fx.branchA, '2030-01-01', '2030-03-01'); // ends in February
+      await expect(addBreak(fx.branchA, '2030-01-01', null)).rejects.toThrow(NOT_COVERED);
+      await expect(addBreak(fx.branchA, '2030-01-01', '2030-03-01')).resolves.toBeTypeOf('string');
+    });
+
+    it('rejects a one-day hole between two shift versions', async () => {
+      await addShift(fx.branchA, '2030-01-01', '2030-02-01');
+      await addShift(fx.branchA, '2030-02-02', '2030-03-01'); // 2030-02-01 is missing
+      await expect(addBreak(fx.branchA, '2030-01-01', '2030-03-01')).rejects.toThrow(NOT_COVERED);
+    });
+
+    it('accepts two adjacent shift versions that jointly span the break', async () => {
+      await addShift(fx.branchA, '2030-01-01', '2030-02-01');
+      await addShift(fx.branchA, '2030-02-01', '2030-03-01');
+      await expect(addBreak(fx.branchA, '2030-01-01', '2030-03-01')).resolves.toBeTypeOf('string');
+    });
+
+    it('does not accept a shift in another branch as justification', async () => {
+      // Same provider, same weekday, same minutes — different branch.
+      await addShift(fx.branchB, VALID_FROM, null);
+      await expect(addBreak(fx.branchA, VALID_FROM, null)).rejects.toThrow(NOT_COVERED);
+      await expect(addBreak(fx.branchB, VALID_FROM, null)).resolves.toBeTypeOf('string');
+    });
+
+    it('follows a shift that wraps past Saturday midnight', async () => {
+      await addShift(fx.branchA, VALID_FROM, null, 6, 1380, 1560); // Sat 23:00 -> 02:00
+      await expect(addBreak(fx.branchA, VALID_FROM, null, 0, 30, 60)).resolves.toBeTypeOf('string');
+      await expect(addBreak(fx.branchA, VALID_FROM, null, 0, 90, 150)).rejects.toThrow(NOT_COVERED);
+    });
   });
 
   it('lists the providers a branch has on a date', async () => {

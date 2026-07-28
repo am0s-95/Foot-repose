@@ -1,13 +1,13 @@
 import {
   addDaysToIsoDate,
-  breakIsInsideShifts,
+  breakIsCoveredByShifts,
   muscatDayUtcRange,
   type OverrideDay,
   type ProviderExtraShift,
   type ProviderWeeklyWindow,
   type WeeklyWindow,
 } from '@foot-repose/domain';
-import type { Queryable } from '../client';
+import { withUnitOfWork, type Queryable } from '../client';
 
 /**
  * Read + write access to the scheduling INPUTS (branch hours, provider
@@ -181,9 +181,25 @@ export interface OverrideInput {
 }
 
 /**
- * Create or replace one branch's override for a Muscat day. Windows under a
- * closed day are rejected by the database itself (composite FK), so this only
- * has to refuse the obviously contradictory call before touching a row.
+ * Create or replace one branch's override for a Muscat day, atomically.
+ *
+ * The whole operation is several statements, so it runs as one unit of work
+ * on ONE connection (see withUnitOfWork): a failure half-way leaves the day
+ * exactly as it was, and callers may pass a pool without losing that.
+ *
+ * Two orderings matter and are not interchangeable:
+ *
+ *  * Concurrency — the header row is created if missing with ON CONFLICT DO
+ *    NOTHING and then locked FOR UPDATE. Two writers racing on the same
+ *    (branch, day) therefore serialise on that row, and the loser rewrites
+ *    the day only after the winner has committed: the day ends up as one
+ *    caller's set, never a blend of both. A Node-side mutex could not do
+ *    this — it would not survive a second process.
+ *  * open -> closed — the windows are deleted BEFORE the header flips to
+ *    closed. The composite FK carries header_is_closed, so flipping the
+ *    header first would be refused (23503) while its windows still exist.
+ *    Nothing about the constraint is weakened or deferred to work around it;
+ *    the writes simply happen in the order the constraint describes.
  */
 export async function saveBranchHoursOverride(
   db: Queryable,
@@ -194,25 +210,38 @@ export async function saveBranchHoursOverride(
   if (input.isClosed && windows.length > 0) {
     throw new Error('a closed override day cannot carry replacement windows');
   }
-  const header = await db.query<{ id: string }>(
-    `INSERT INTO branch_hours_overrides (branch_id, muscat_date, is_closed, note)
-     VALUES ($1, $2::date, $3, $4)
-     ON CONFLICT (branch_id, muscat_date)
-       DO UPDATE SET is_closed = excluded.is_closed, note = excluded.note
-     RETURNING id`,
-    [branchId, input.muscatDate, input.isClosed, input.note ?? null],
-  );
-  const overrideId = header.rows[0]!.id;
-  await db.query('DELETE FROM branch_hours_override_windows WHERE override_id = $1', [overrideId]);
-  for (const window of windows) {
-    await db.query(
-      `INSERT INTO branch_hours_override_windows
-         (override_id, header_is_closed, open_minute, close_minute)
-       VALUES ($1, false, $2, $3)`,
-      [overrideId, window.openMinute, window.closeMinute],
+  return withUnitOfWork(db, async (tx) => {
+    await tx.query(
+      `INSERT INTO branch_hours_overrides (branch_id, muscat_date, is_closed, note)
+       VALUES ($1, $2::date, $3, $4)
+       ON CONFLICT (branch_id, muscat_date) DO NOTHING`,
+      [branchId, input.muscatDate, input.isClosed, input.note ?? null],
     );
-  }
-  return overrideId;
+    const locked = await tx.query<{ id: string }>(
+      `SELECT id FROM branch_hours_overrides
+       WHERE branch_id = $1 AND muscat_date = $2::date
+       FOR UPDATE`,
+      [branchId, input.muscatDate],
+    );
+    const overrideId = locked.rows[0]!.id;
+
+    await tx.query('DELETE FROM branch_hours_override_windows WHERE override_id = $1', [
+      overrideId,
+    ]);
+    await tx.query(
+      'UPDATE branch_hours_overrides SET is_closed = $2, note = $3 WHERE id = $1',
+      [overrideId, input.isClosed, input.note ?? null],
+    );
+    for (const window of windows) {
+      await tx.query(
+        `INSERT INTO branch_hours_override_windows
+           (override_id, header_is_closed, open_minute, close_minute)
+         VALUES ($1, false, $2, $3)`,
+        [overrideId, window.openMinute, window.closeMinute],
+      );
+    }
+    return overrideId;
+  });
 }
 
 export interface ProviderWeeklyWindowInput extends WeeklyWindowInput {
@@ -221,55 +250,69 @@ export interface ProviderWeeklyWindowInput extends WeeklyWindowInput {
 }
 
 /**
- * Insert a provider shift or break.
+ * Insert a provider shift or break, atomically.
  *
- * A break must lie inside that provider's shifts. The database cannot state
- * that (it is a containment across rows of the same table), so it is checked
- * here against the shifts whose validity overlaps the break's own.
+ * A break must be covered by that provider's shifts IN THE SAME BRANCH, for
+ * every date of its validity and every minute of its week geometry — see
+ * `breakIsCoveredByShifts`. The database cannot state that: it is a
+ * containment across rows of one table, over two dimensions at once.
  *
- * The FOR SHARE below only holds until the end of the surrounding
- * transaction: pass a transaction client (`withTransaction`) and a
- * concurrent shift change cannot slip between the check and the insert. Call
- * it on a bare pool and each statement is its own transaction, so the check
- * is advisory. Either way the failure direction is safe — a break that ends
- * up outside a shift only ever removes availability.
+ * Check and insert run as one unit of work on one connection, and the
+ * candidate shifts are read FOR SHARE, so a concurrent change to those
+ * shifts cannot slip between the check and the write.
+ *
+ * Scope, stated exactly: this slice exposes no update or delete path for
+ * weekly windows, so the only way to create a break is through this
+ * function. Shortening or removing a shift by direct SQL WOULD strand an
+ * existing break, and nothing in the database prevents that — the guarantee
+ * here is a repository guarantee, not a constraint. Its failure direction is
+ * safe: a stranded break only ever removes availability. The seed invariant
+ * suite re-proves the property over the whole dataset.
  */
 export async function insertProviderWeeklyWindow(
   db: Queryable,
   employeeId: string,
   window: ProviderWeeklyWindowInput,
 ): Promise<string> {
-  if (window.kind === 'break') {
-    const shifts = await db.query<WeeklyRow>(
-      `SELECT lower(valid_dates)::text AS valid_from, upper(valid_dates)::text AS valid_to,
-              day_of_week, open_minute, close_minute
-       FROM provider_weekly_windows
-       WHERE employee_id = $1 AND kind = 'shift'
-         AND valid_dates && daterange($2::date, $3::date, '[)')
-       FOR SHARE`,
-      [employeeId, window.validFrom, window.validTo],
-    );
-    if (!breakIsInsideShifts(window, shifts.rows.map(toWeekly))) {
-      throw new Error('a break must lie inside one of the provider\'s shifts');
+  return withUnitOfWork(db, async (tx) => {
+    if (window.kind === 'break') {
+      const shifts = await tx.query<WeeklyRow>(
+        `SELECT lower(valid_dates)::text AS valid_from, upper(valid_dates)::text AS valid_to,
+                day_of_week, open_minute, close_minute
+         FROM provider_weekly_windows
+         WHERE employee_id = $1 AND kind = 'shift' AND branch_id = $2
+           AND valid_dates && daterange($3::date, $4::date, '[)')
+         FOR SHARE`,
+        [employeeId, window.branchId, window.validFrom, window.validTo],
+      );
+      const covered = breakIsCoveredByShifts(
+        { ...window, branchId: window.branchId },
+        shifts.rows.map((row) => ({ ...toWeekly(row), branchId: window.branchId })),
+      );
+      if (!covered) {
+        throw new Error(
+          "a break must be covered by this provider's shifts in the same branch, for every date of its validity",
+        );
+      }
     }
-  }
-  const result = await db.query<{ id: string }>(
-    `INSERT INTO provider_weekly_windows
-       (employee_id, branch_id, kind, valid_dates, day_of_week, open_minute, close_minute)
-     VALUES ($1, $2, $3, daterange($4::date, $5::date, '[)'), $6, $7, $8)
-     RETURNING id`,
-    [
-      employeeId,
-      window.branchId,
-      window.kind,
-      window.validFrom,
-      window.validTo,
-      window.dayOfWeek,
-      window.openMinute,
-      window.closeMinute,
-    ],
-  );
-  return result.rows[0]!.id;
+    const result = await tx.query<{ id: string }>(
+      `INSERT INTO provider_weekly_windows
+         (employee_id, branch_id, kind, valid_dates, day_of_week, open_minute, close_minute)
+       VALUES ($1, $2, $3, daterange($4::date, $5::date, '[)'), $6, $7, $8)
+       RETURNING id`,
+      [
+        employeeId,
+        window.branchId,
+        window.kind,
+        window.validFrom,
+        window.validTo,
+        window.dayOfWeek,
+        window.openMinute,
+        window.closeMinute,
+      ],
+    );
+    return result.rows[0]!.id;
+  });
 }
 
 export async function insertProviderExtraShift(

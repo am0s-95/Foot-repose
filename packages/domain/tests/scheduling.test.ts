@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
-  breakIsInsideShifts,
+  breakIsCoveredByShifts,
   intersectIntervals,
   materializeBranchHours,
   materializeProviderPresence,
   muscatDayOfWeek,
   versionCoversDate,
   weekSpansOf,
+  type CoverageWindow,
   type OverrideDay,
   type ProviderWeeklyWindow,
   type UtcInterval,
@@ -238,19 +239,83 @@ describe('provider presence materialisation', () => {
   });
 });
 
-describe('break containment', () => {
-  const shiftWindow = { dayOfWeek: 0, openMinute: 600, closeMinute: 1080 };
+describe('break coverage over time AND dates', () => {
+  const BRANCH_A = 'aaaaaaaa-0000-0000-0000-000000000001';
+  const BRANCH_B = 'bbbbbbbb-0000-0000-0000-000000000002';
+  const shiftAt = (over: Partial<CoverageWindow> = {}): CoverageWindow => ({
+    validFrom: '2030-01-01',
+    validTo: null,
+    dayOfWeek: 0,
+    openMinute: 600,
+    closeMinute: 1080,
+    branchId: BRANCH_A,
+    ...over,
+  });
+  const breakAt = (over: Partial<CoverageWindow> = {}): CoverageWindow =>
+    shiftAt({ openMinute: 780, closeMinute: 810, ...over });
 
-  it('accepts a break inside a shift and rejects one outside it', () => {
-    expect(breakIsInsideShifts({ dayOfWeek: 0, openMinute: 780, closeMinute: 810 }, [shiftWindow])).toBe(true);
-    expect(breakIsInsideShifts({ dayOfWeek: 0, openMinute: 1050, closeMinute: 1140 }, [shiftWindow])).toBe(false);
-    expect(breakIsInsideShifts({ dayOfWeek: 1, openMinute: 780, closeMinute: 810 }, [shiftWindow])).toBe(false);
-    expect(breakIsInsideShifts({ dayOfWeek: 0, openMinute: 780, closeMinute: 810 }, [])).toBe(false);
+  it('accepts a break inside a shift and rejects one outside its minutes', () => {
+    expect(breakIsCoveredByShifts(breakAt(), [shiftAt()])).toBe(true);
+    expect(breakIsCoveredByShifts(breakAt({ openMinute: 1050, closeMinute: 1140 }), [shiftAt()])).toBe(false);
+    expect(breakIsCoveredByShifts(breakAt({ dayOfWeek: 1 }), [shiftAt()])).toBe(false);
+    expect(breakIsCoveredByShifts(breakAt(), [])).toBe(false);
+  });
+
+  it('rejects a break that outlives the shift that would justify it', () => {
+    // Overlapping date ranges are NOT coverage: this shift stops in February.
+    const shift = shiftAt({ validFrom: '2030-01-01', validTo: '2030-03-01' });
+    expect(breakIsCoveredByShifts(breakAt({ validFrom: '2030-01-01', validTo: null }), [shift])).toBe(false);
+    expect(breakIsCoveredByShifts(breakAt({ validFrom: '2030-01-01', validTo: '2030-03-01' }), [shift])).toBe(true);
+    // ...and one that starts before the shift does is refused from the front.
+    expect(breakIsCoveredByShifts(breakAt({ validFrom: '2029-12-01', validTo: '2030-02-01' }), [shift])).toBe(false);
+  });
+
+  it('rejects a one-day hole in the middle of the break range', () => {
+    const first = shiftAt({ validFrom: '2030-01-01', validTo: '2030-02-01' });
+    const second = shiftAt({ validFrom: '2030-02-02', validTo: '2030-03-01' }); // 2030-02-01 missing
+    expect(
+      breakIsCoveredByShifts(breakAt({ validFrom: '2030-01-01', validTo: '2030-03-01' }), [first, second]),
+    ).toBe(false);
+  });
+
+  it('accepts two adjacent shift versions that jointly span the break', () => {
+    const first = shiftAt({ validFrom: '2030-01-01', validTo: '2030-02-01' });
+    const second = shiftAt({ validFrom: '2030-02-01', validTo: '2030-03-01' });
+    expect(
+      breakIsCoveredByShifts(breakAt({ validFrom: '2030-01-01', validTo: '2030-03-01' }), [first, second]),
+    ).toBe(true);
+  });
+
+  it('accepts two shifts that jointly cover the minutes of the break', () => {
+    const morning = shiftAt({ openMinute: 600, closeMinute: 795 });
+    const afternoon = shiftAt({ openMinute: 795, closeMinute: 1080 });
+    expect(breakIsCoveredByShifts(breakAt(), [morning, afternoon])).toBe(true);
+    const gapped = shiftAt({ openMinute: 800, closeMinute: 1080 }); // 795..800 uncovered
+    expect(breakIsCoveredByShifts(breakAt(), [morning, gapped])).toBe(false);
+  });
+
+  it('does not let a shift in another branch justify this branch\'s break', () => {
+    const elsewhere = shiftAt({ branchId: BRANCH_B });
+    expect(breakIsCoveredByShifts(breakAt({ branchId: BRANCH_A }), [elsewhere])).toBe(false);
+    expect(breakIsCoveredByShifts(breakAt({ branchId: BRANCH_B }), [elsewhere])).toBe(true);
   });
 
   it('follows a shift that wraps past Saturday midnight', () => {
-    const nightShift = { dayOfWeek: 6, openMinute: 1380, closeMinute: 1560 }; // Sat 23:00 -> 02:00
-    expect(breakIsInsideShifts({ dayOfWeek: 0, openMinute: 30, closeMinute: 60 }, [nightShift])).toBe(true);
-    expect(breakIsInsideShifts({ dayOfWeek: 0, openMinute: 90, closeMinute: 150 }, [nightShift])).toBe(false);
+    const nightShift = shiftAt({ dayOfWeek: 6, openMinute: 1380, closeMinute: 1560 }); // Sat 23:00 -> 02:00
+    expect(breakIsCoveredByShifts(breakAt({ dayOfWeek: 0, openMinute: 30, closeMinute: 60 }), [nightShift])).toBe(true);
+    expect(breakIsCoveredByShifts(breakAt({ dayOfWeek: 0, openMinute: 90, closeMinute: 150 }), [nightShift])).toBe(false);
+  });
+
+  it('applies the date rule to a wrapping shift as well', () => {
+    const nightShift = shiftAt({
+      dayOfWeek: 6,
+      openMinute: 1380,
+      closeMinute: 1560,
+      validFrom: '2030-01-01',
+      validTo: '2030-03-01',
+    });
+    const wrapBreak = breakAt({ dayOfWeek: 0, openMinute: 30, closeMinute: 60 });
+    expect(breakIsCoveredByShifts({ ...wrapBreak, validTo: '2030-03-01' }, [nightShift])).toBe(true);
+    expect(breakIsCoveredByShifts({ ...wrapBreak, validTo: '2030-03-02' }, [nightShift])).toBe(false);
   });
 });

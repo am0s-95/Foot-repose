@@ -147,16 +147,68 @@ export function weekSpansOf(window: Pick<WeeklyWindow, 'dayOfWeek' | 'openMinute
   ];
 }
 
+/** A weekly window as the break-coverage check sees it: dated, and (when the
+ * caller knows it) attached to a branch. */
+export interface CoverageWindow extends DatedVersion {
+  dayOfWeek: number;
+  openMinute: number;
+  closeMinute: number;
+  branchId?: string;
+}
+
 /**
- * Is every minute of `breakWindow` inside the union of `shifts`?
- * Fail-safe by design: a stray break only ever REMOVES availability, so this
- * is validated in the write path rather than enforced as a constraint.
+ * Is EVERY date of `breakWindow.validDates` covered by shifts that also cover
+ * every minute of its week geometry?
+ *
+ * Overlapping date ranges are not enough: a shift version ending in February
+ * does not justify a break that runs past February. The check therefore walks
+ * the break's date range segment by segment — cut at every shift version
+ * boundary — and on each segment asks whether the UNION of the shifts in
+ * force there covers the break's week spans. Two adjacent shift versions that
+ * jointly span the break's dates are accepted; a one-day gap is not.
+ *
+ * A break belongs to its branch: a shift of the same provider in a DIFFERENT
+ * branch never justifies it. Shifts carrying a branch that differs from the
+ * break's are dropped before the geometry is considered.
+ *
+ * The geometry is `weekSpansOf` — the same decomposition the database's
+ * generated `week_spans` column uses — so midnight crossings and the
+ * Saturday -> Sunday wrap behave identically here and in the constraints.
+ *
+ * Fail-safe by design: a break that ends up outside a shift only ever REMOVES
+ * availability, which is why this is a write-path check rather than a
+ * constraint.
  */
-export function breakIsInsideShifts(
-  breakWindow: Pick<WeeklyWindow, 'dayOfWeek' | 'openMinute' | 'closeMinute'>,
-  shifts: Pick<WeeklyWindow, 'dayOfWeek' | 'openMinute' | 'closeMinute'>[],
+export function breakIsCoveredByShifts(
+  breakWindow: CoverageWindow,
+  shifts: CoverageWindow[],
 ): boolean {
-  return covers(shifts.flatMap(weekSpansOf), weekSpansOf(breakWindow));
+  const from = breakWindow.validFrom;
+  const to = breakWindow.validTo;
+  const sameBranch = shifts.filter(
+    (s) =>
+      s.branchId === undefined ||
+      breakWindow.branchId === undefined ||
+      s.branchId === breakWindow.branchId,
+  );
+  const insideBreak = (date: string): boolean => date > from && (to === null || date < to);
+  // One segment per stretch of dates over which the set of shift versions in
+  // force does not change.
+  const starts = [
+    from,
+    ...new Set(
+      sameBranch
+        .flatMap((s) => [s.validFrom, s.validTo])
+        .filter((date): date is string => date !== null && insideBreak(date)),
+    ),
+  ].sort();
+
+  const target = weekSpansOf(breakWindow);
+  for (const start of starts) {
+    const inForce = sameBranch.filter((s) => versionCoversDate(s, start));
+    if (!covers(inForce.flatMap(weekSpansOf), target)) return false;
+  }
+  return true;
 }
 
 function dayStartMs(isoDate: string): number {
