@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16.13
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: foot_repose_test
@@ -29,6 +29,15 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Assert the pinned PostgreSQL server version
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d foot_repose_test \
+            -c 'SELECT version();' -tA
+          num=$(PGPASSWORD=postgres psql -h localhost -U postgres -d foot_repose_test \
+            -tAc 'SHOW server_version_num')
+          echo "server_version_num=$num"
+          test "$num" = "160013" || {
+            echo "::error::expected PostgreSQL 16.13 (160013), got $num"; exit 1; }
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
@@ -40,7 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16.13
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: foot_repose_dev
@@ -60,6 +69,15 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Assert the pinned PostgreSQL server version
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d foot_repose_dev \
+            -c 'SELECT version();' -tA
+          num=$(PGPASSWORD=postgres psql -h localhost -U postgres -d foot_repose_dev \
+            -tAc 'SHOW server_version_num')
+          echo "server_version_num=$num"
+          test "$num" = "160013" || {
+            echo "::error::expected PostgreSQL 16.13 (160013), got $num"; exit 1; }
       - run: npm ci
       - run: npm run db:migrate
       - run: npm run db:seed

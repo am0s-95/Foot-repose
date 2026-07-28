@@ -102,6 +102,61 @@ a frontend imports database/server modules (bare specifiers or relative
 paths into `apps/api`/`packages/db`), when `domain` gains any dependency
 (imports or its package.json), or when `contracts` touches the database.
 
+## Scheduling inputs (slice 2A.2a)
+
+Migration `0005` adds the *inputs* a scheduling engine will later read.
+There is no engine, no availability endpoint and no UI yet — on purpose.
+
+- `branch_weekly_windows` / `provider_weekly_windows` — dated weekly
+  templates. A window may cross midnight; the cyclic week (including the
+  Saturday → Sunday wrap) is policed by PostgreSQL through a generated
+  `int4multirange` and a GiST exclusion constraint. `branch_id` is
+  deliberately **outside** the provider key, so one provider's shifts can
+  never overlap even across two branches.
+- `branch_hours_overrides` (+ `branch_hours_override_windows`) — a
+  Muscat-day override owns every minute of its day. A window under a closed
+  day is impossible by composite foreign key, override windows never cross
+  midnight, and past days are immutable history.
+- `provider_branch_assignments`, `provider_service_qualifications`,
+  `provider_extra_shifts` — dated operational assignment, dated
+  qualification, and concrete extra shifts in UTC instants.
+
+Two rules the database cannot express live in `@foot-repose/domain`
+(`materializeBranchHours`, `materializeProviderPresence`) and are tested in
+both directions:
+
+- **Version-boundary carry-in** — each dated version owns the minutes of
+  its own dates, so a midnight-crossing window is clipped at a version
+  boundary instead of leaking into the next version's day.
+- **An extra shift overrides the weekly template** for the minutes it
+  covers rather than adding to it. That is what keeps one provider from
+  appearing available in two branches at the same instant while leaving no
+  gap in total coverage.
+
+A break must be covered by that provider's shifts **in the same branch**,
+occurrence by occurrence. Coverage is decided on the windows the schedule
+really produces — with the same function materialisation uses — not on abstract
+week geometry: overlapping date ranges are not coverage, two adjacent shift
+versions may cover a break jointly, and an occurrence that runs past midnight
+belongs to the day it **started** on, so the version that must be in force is
+the one covering that anchor day (for every weekday transition, not only
+Saturday→Sunday). A Saturday 23:00→Sunday 02:00 shift whose version begins on
+the Sunday produces no Sunday-morning occurrence at all, and cannot justify a
+break there. That containment crosses rows of a single table over two
+dimensions, so it is validated in the write path
+(`insertProviderWeeklyWindow`) and re-proved over the seed by anti-join. It is a repository guarantee, not a
+constraint: this slice exposes no update or delete path for weekly windows, but
+direct SQL shortening a shift would strand a break and nothing in the database
+stops that. The failure direction is safe — a stranded break only ever removes
+availability.
+
+Writes that touch several rows run as one unit of work on one connection
+(`withUnitOfWork`), so `saveBranchHoursOverride` is atomic even when handed a
+pool: it creates the day's header if missing, locks it `FOR UPDATE` (two
+concurrent writers therefore serialise and one caller's complete set wins), then
+deletes the old windows *before* flipping the header — the order the composite
+foreign key demands, with no constraint weakened or deferred.
+
 ## Checks
 
 ```bash
