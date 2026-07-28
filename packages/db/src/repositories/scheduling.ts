@@ -225,9 +225,14 @@ export interface ProviderWeeklyWindowInput extends WeeklyWindowInput {
  *
  * A break must lie inside that provider's shifts. The database cannot state
  * that (it is a containment across rows of the same table), so it is checked
- * here against the shifts whose validity overlaps the break's own. The check
- * runs in the caller's transaction and takes the row locks it read, so a
- * concurrent shift change cannot slip underneath it.
+ * here against the shifts whose validity overlaps the break's own.
+ *
+ * The FOR SHARE below only holds until the end of the surrounding
+ * transaction: pass a transaction client (`withTransaction`) and a
+ * concurrent shift change cannot slip between the check and the insert. Call
+ * it on a bare pool and each statement is its own transaction, so the check
+ * is advisory. Either way the failure direction is safe — a break that ends
+ * up outside a shift only ever removes availability.
  */
 export async function insertProviderWeeklyWindow(
   db: Queryable,
