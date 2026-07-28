@@ -64,7 +64,7 @@ jobs:
       - run: npm run db:migrate
       - run: npm run db:seed
       - run: npx playwright install --with-deps chromium
-      - run: npm run build -w @foot-repose/api -w @foot-repose/branch-app
+      - run: npm run build -w @foot-repose/api -w @foot-repose/branch-app -w @foot-repose/customer-app
       - run: npm run test:e2e
       - uses: actions/upload-artifact@v4
         if: failure()

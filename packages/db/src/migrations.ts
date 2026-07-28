@@ -8,9 +8,18 @@ const MIGRATIONS_DIR = fileURLToPath(new URL('../migrations/', import.meta.url))
 /** App-wide advisory lock so concurrent deploys never race migrations. */
 const MIGRATION_LOCK_KEY = 727_331;
 
+export interface RunMigrationsOptions {
+  /** Apply only migrations whose filename sorts <= this value (tests use it
+   * to reproduce upgrade paths from an older schema). */
+  upTo?: string;
+}
+
 /** Apply all pending .sql migrations in filename order, one transaction each.
  * Forward-only: rolling back means writing a new forward migration. */
-export async function runMigrations(pool: Pool): Promise<string[]> {
+export async function runMigrations(
+  pool: Pool,
+  options: RunMigrationsOptions = {},
+): Promise<string[]> {
   const client = await pool.connect();
   const applied: string[] = [];
   try {
@@ -26,7 +35,10 @@ export async function runMigrations(pool: Pool): Promise<string[]> {
         (row) => row.version,
       ),
     );
-    const files = (await readdir(MIGRATIONS_DIR)).filter((f) => f.endsWith('.sql')).sort();
+    const files = (await readdir(MIGRATIONS_DIR))
+      .filter((f) => f.endsWith('.sql'))
+      .filter((f) => !options.upTo || f <= options.upTo)
+      .sort();
     for (const file of files) {
       if (done.has(file)) continue;
       const sql = await readFile(join(MIGRATIONS_DIR, file), 'utf8');

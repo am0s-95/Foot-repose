@@ -1,5 +1,10 @@
 import { z } from 'zod';
-import { BOOKING_ACTIONS, BOOKING_STATUSES, EMPLOYEE_ROLES } from '@foot-repose/domain';
+import {
+  BOOKING_ACTIONS,
+  BOOKING_STATUSES,
+  CUSTOMER_SEGMENTS,
+  EMPLOYEE_ROLES,
+} from '@foot-repose/domain';
 
 // ---------------------------------------------------------------- auth
 
@@ -56,7 +61,13 @@ export const bookingDtoSchema = z.object({
   priceFormatted: z.string(),
   currency: z.literal('OMR'),
   notes: z.string().nullable(),
-  service: z.object({ id: z.string().uuid(), name: z.string(), durationMin: z.number().int() }),
+  service: z.object({
+    id: z.string().uuid(),
+    name: z.string(),
+    durationMin: z.number().int().positive(),
+    bufferBeforeMin: z.number().int().nonnegative(),
+    bufferAfterMin: z.number().int().nonnegative(),
+  }),
   customer: z.object({ id: z.string().uuid(), fullName: z.string(), phone: z.string() }),
   assignedEmployee: z.object({ id: z.string().uuid(), fullName: z.string() }).nullable(),
   /** Actions the CURRENT actor may perform, computed server-side. */
@@ -84,11 +95,39 @@ export type TransitionResponse = z.infer<typeof transitionResponseSchema>;
 export const branchesResponseSchema = z.object({ branches: z.array(branchSummarySchema) });
 export type BranchesResponse = z.infer<typeof branchesResponseSchema>;
 
-export const publicBranchSchema = branchSummarySchema.extend({ phone: z.string() });
+export const customerSegmentSchema = z.enum(CUSTOMER_SEGMENTS);
+
+export const publicBranchSchema = branchSummarySchema.extend({
+  phone: z.string(),
+  /** null = not yet classified (real classifications are business data). */
+  customerSegment: customerSegmentSchema.nullable(),
+});
 export type PublicBranch = z.infer<typeof publicBranchSchema>;
 
 export const publicBranchesResponseSchema = z.object({ branches: z.array(publicBranchSchema) });
 export type PublicBranchesResponse = z.infer<typeof publicBranchesResponseSchema>;
+
+// ---------------------------------------------------------------- catalog
+
+export const publicBranchServiceSchema = z.object({
+  serviceId: z.string().uuid(),
+  name: z.string(),
+  durationMin: z.number().int().positive(),
+  priceBaisa: z.number().int().nonnegative(),
+  priceFormatted: z.string(),
+  bufferBeforeMin: z.number().int().nonnegative(),
+  bufferAfterMin: z.number().int().nonnegative(),
+  isBookableOnline: z.boolean(),
+});
+export type PublicBranchService = z.infer<typeof publicBranchServiceSchema>;
+
+export const branchCatalogResponseSchema = z.object({
+  branch: publicBranchSchema,
+  /** Muscat calendar date the catalog is effective for. */
+  date: z.string(),
+  services: z.array(publicBranchServiceSchema),
+});
+export type BranchCatalogResponse = z.infer<typeof branchCatalogResponseSchema>;
 
 // ---------------------------------------------------------------- errors
 

@@ -91,9 +91,47 @@ export async function insertBooking(input: BookingInput): Promise<string> {
   const startsAt = muscatDateTimeToUtc(input.isoDate, input.hour);
   const endsAt = new Date(startsAt.getTime() + 45 * 60_000);
   const result = await getPool().query<{ id: string }>(
-    `INSERT INTO bookings (branch_id, customer_id, service_id, status, starts_at, ends_at, price_baisa)
-     VALUES ($1, $2, $3, $4, $5, $6, 8500) RETURNING id`,
+    `INSERT INTO bookings
+       (branch_id, customer_id, service_id, status, starts_at, ends_at, price_baisa,
+        service_name_snapshot, duration_min_snapshot, buffer_before_min_snapshot, buffer_after_min_snapshot)
+     SELECT $1, $2, s.id, $4, $5, $6, 8500, s.name, s.duration_min, 0, 10
+     FROM services s WHERE s.id = $3
+     RETURNING id`,
     [input.branchId, input.customerId, input.serviceId, input.status, startsAt, endsAt],
+  );
+  return result.rows[0]!.id;
+}
+
+export interface OfferingInput {
+  branchId: string;
+  serviceId: string;
+  from: Date;
+  to: Date | null;
+  priceBaisa: number;
+  durationMin: number;
+  bufferBeforeMin?: number;
+  bufferAfterMin?: number;
+  isBookableOnline?: boolean;
+}
+
+export async function insertOffering(input: OfferingInput): Promise<string> {
+  const result = await getPool().query<{ id: string }>(
+    `INSERT INTO branch_service_offerings
+       (branch_id, service_id, valid_during, price_baisa, duration_min,
+        buffer_before_min, buffer_after_min, is_bookable_online)
+     VALUES ($1, $2, tstzrange($3, $4, '[)'), $5, $6, $7, $8, $9)
+     RETURNING id`,
+    [
+      input.branchId,
+      input.serviceId,
+      input.from,
+      input.to,
+      input.priceBaisa,
+      input.durationMin,
+      input.bufferBeforeMin ?? 0,
+      input.bufferAfterMin ?? 10,
+      input.isBookableOnline ?? true,
+    ],
   );
   return result.rows[0]!.id;
 }

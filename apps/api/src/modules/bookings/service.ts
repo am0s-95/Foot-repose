@@ -4,6 +4,7 @@ import {
   checkBookingActionPermission,
   formatMuscatTime,
   formatOmr,
+  isIsoDate,
   muscatDayUtcRange,
   nextStatus,
   todayInMuscat,
@@ -58,6 +59,7 @@ export async function listBranchDayBookings(
   if (!branch) throw new HttpError(404, 'not_found', 'Branch not found');
 
   const date = query.date ?? todayInMuscat();
+  if (!isIsoDate(date)) throw new HttpError(400, 'validation_error', `Invalid date: ${date}`);
   const { startUtc, endUtc } = muscatDayUtcRange(date);
   const records = await listBookingsForBranchRange(getPool(), branchId, startUtc, endUtc, {
     status: query.status,
