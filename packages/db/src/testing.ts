@@ -5,18 +5,24 @@ import { runMigrations } from './migrations';
 // but upgrade-path tests need to drive them directly.
 export { runMigrations } from './migrations';
 
+/** Exact-suffix rule shared by the live-connection guard and its unit tests:
+ * only names ending precisely in `_test` qualify — `foot_repose_test_backup`
+ * does not. */
+export function isTestDatabaseName(name: string): boolean {
+  return name.endsWith('_test');
+}
+
 /**
  * Last line of defense before any destructive reset: ask the LIVE connection
  * which database it is actually attached to, and refuse unless that name
  * ends exactly with `_test`. Checking DATABASE_URL (or trusting the caller)
  * is not enough — one mis-set env var must not be able to wipe a real
- * database. `foot_repose_test_backup` does NOT qualify; the suffix must be
- * exactly `_test`.
+ * database.
  */
 async function assertConnectedToTestDatabase(pool: Pool): Promise<void> {
   const result = await pool.query<{ db: string }>('SELECT current_database() AS db');
   const db = result.rows[0]!.db;
-  if (!db.endsWith('_test')) {
+  if (!isTestDatabaseName(db)) {
     throw new Error(
       `Refusing to reset schema: connected database "${db}" does not end with _test. ` +
         'resetDatabase/resetDatabaseTo are destructive test helpers only.',
