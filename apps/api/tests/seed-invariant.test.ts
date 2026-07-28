@@ -313,7 +313,12 @@ describe('seed invariants', () => {
     );
     const { staff, home, other, from } = ids.rows[0]!;
 
-    const brokenFixtures: Record<keyof typeof INVARIANTS, string> = {
+    // `claimsViolatingEligibility` has no broken fixture on purpose: since the
+    // allocation eligibility guard landed, an uncovered live claim can no longer
+    // be created through ordinary DML at all. The database rejection is tested
+    // instead, below — an invariant fixture for an unreachable state would only
+    // prove the trigger was disabled.
+    const brokenFixtures: Partial<Record<keyof typeof INVARIANTS, string>> = {
       // The midnight version-boundary case: a Saturday 23:00 -> Sunday 02:00
       // shift whose version only starts on the Sunday produces no Sunday
       // occurrence at all, so the Sunday-morning break it "justifies" is
@@ -345,23 +350,6 @@ describe('seed invariants', () => {
       liveClaimsOnNonHoldingBookings: `UPDATE bookings SET status = 'cancelled'
         WHERE id = (SELECT booking_id FROM booking_provider_allocations
                      WHERE released_at IS NULL ORDER BY booking_id LIMIT 1)`,
-      // One claim by a provider nobody ever assigned or qualified.
-      claimsViolatingEligibility: `INSERT INTO employees (email, password_hash, full_name, role)
-        VALUES ('probe.unassigned@test.example', 'x', 'Probe Unassigned', 'staff');
-        INSERT INTO bookings (branch_id, customer_id, service_id, status, starts_at, ends_at,
-          price_baisa, service_name_snapshot, duration_min_snapshot,
-          buffer_before_min_snapshot, buffer_after_min_snapshot)
-        SELECT b.branch_id, b.customer_id, b.service_id, 'confirmed',
-               '2036-01-01T06:00:00Z'::timestamptz, '2036-01-01T07:00:00Z'::timestamptz,
-               b.price_baisa, b.service_name_snapshot, b.duration_min_snapshot, 0, 0
-        FROM bookings b ORDER BY b.id LIMIT 1;
-        INSERT INTO booking_provider_allocations
-          (booking_id, branch_id, employee_id, b_starts_at, b_ends_at, b_buf_before, b_buf_after)
-        SELECT bk.id, bk.branch_id, e.id, bk.starts_at, bk.ends_at,
-               bk.buffer_before_min_snapshot, bk.buffer_after_min_snapshot
-        FROM bookings bk, employees e
-        WHERE bk.starts_at = '2036-01-01T06:00:00Z'::timestamptz
-          AND e.email = 'probe.unassigned@test.example'`,
       // Release one unit of a booking that still requires it.
       unsatisfiedRequirements: `UPDATE booking_resource_allocations
         SET released_at = now(), release_reason = 'probe'
@@ -390,6 +378,59 @@ describe('seed invariants', () => {
     }
     // The rollbacks put everything back: the invariants hold again.
     for (const sql of Object.values(INVARIANTS)) expect(await violations(sql)).toBe(0);
+  });
+
+  it('[C2-reschedule] the database refuses to create an uncovered live claim at all', async () => {
+    const pool = getPool();
+    const target = await pool.query<{ booking_id: string }>(
+      `SELECT a.booking_id FROM booking_provider_allocations a
+       JOIN bookings b ON b.id = a.booking_id
+       WHERE a.released_at IS NULL AND b.status = 'confirmed'
+       ORDER BY a.booking_id LIMIT 1`,
+    );
+    const bookingId = target.rows[0]!.booking_id;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // An unassigned, unqualified provider cannot be given a live claim...
+      await client.query(
+        `INSERT INTO employees (email, password_hash, full_name, role)
+         VALUES ('probe.unassigned@test.example', 'x', 'Probe Unassigned', 'staff')`,
+      );
+      // A fresh booking, so the one-live-provider index is not what refuses.
+      const probe = await client.query<{ id: string }>(
+        `INSERT INTO bookings
+           (branch_id, customer_id, service_id, status, starts_at, ends_at, price_baisa,
+            service_name_snapshot, duration_min_snapshot,
+            buffer_before_min_snapshot, buffer_after_min_snapshot)
+         SELECT branch_id, customer_id, service_id, 'confirmed',
+                '2036-01-01T06:00:00Z'::timestamptz, '2036-01-01T07:00:00Z'::timestamptz,
+                price_baisa, service_name_snapshot, duration_min_snapshot,
+                buffer_before_min_snapshot, buffer_after_min_snapshot
+         FROM bookings WHERE id = $1 RETURNING id`,
+        [bookingId],
+      );
+      const inserting = client
+        .query(
+          `INSERT INTO booking_provider_allocations
+             (booking_id, branch_id, employee_id, b_starts_at, b_ends_at, b_buf_before, b_buf_after)
+           SELECT b.id, b.branch_id, e.id, b.starts_at, b.ends_at,
+                  b.buffer_before_min_snapshot, b.buffer_after_min_snapshot
+           FROM bookings b, employees e
+           WHERE b.id = $1 AND e.email = 'probe.unassigned@test.example'`,
+          [probe.rows[0]!.id],
+        )
+        .then(
+          () => 'no error',
+          (error: { code?: string }) => error.code ?? 'unknown',
+        );
+      expect(await inserting).toBe('P0001');
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
+    // ...and the seed itself has none.
+    expect(await violations(INVARIANTS.claimsViolatingEligibility)).toBe(0);
   });
 
   it('[C5] the requirement invariant catches an EXTRA type and a live unit on a zero-requirement set', async () => {

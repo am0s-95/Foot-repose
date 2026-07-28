@@ -217,6 +217,14 @@ scheduling table are **not** protected and keep their current behaviour. Real
 enforcement needs an application role separate from the migration role, which
 this codebase does not have today.
 
+Eligibility is enforced from **three** ends, because both the evidence and the
+claim can move. A statement-level guard rejects an `UPDATE`/`DELETE` of the
+eligibility tables that would leave a live claim uncovered; a row-level guard
+rejects any live claim — newly inserted, or moved by the reschedule cascade —
+whose NEW window falls outside the provider's assignment or qualification; and
+the `0005 → 0006` preflight aborts rather than backfilling a live claim that
+legacy data cannot justify.
+
 Eligibility is enforced from both ends. Allocation reads the covering
 assignment and qualification rows `FOR SHARE` — the rows it returns *are* the
 evidence, so a concurrent change cannot slip between the check and the write.

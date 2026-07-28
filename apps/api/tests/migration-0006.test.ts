@@ -55,6 +55,20 @@ async function seedAt0005(overrides: { bufferAfter?: number; durationHours?: num
     )
   ).id;
 
+  // A real 0005 database that used T5/T6 has these rows. The migration must
+  // never invent them — the fixture supplies them, and a separate test proves
+  // the migration aborts when they are missing.
+  await pool.query(
+    `INSERT INTO provider_branch_assignments (employee_id, branch_id, valid_dates)
+     VALUES ($1, $2, daterange('2020-01-01'::date, NULL, '[)'))`,
+    [employee, branch],
+  );
+  await pool.query(
+    `INSERT INTO provider_service_qualifications (employee_id, service_id, valid_dates)
+     VALUES ($1, $2, daterange('2020-01-01'::date, NULL, '[)'))`,
+    [employee, service],
+  );
+
   const insert = async (
     status: string,
     provider: string | null,
@@ -298,6 +312,33 @@ describe('migration 0006 preflight [15 / R6a / R6b]', () => {
     expect((/sample: (.*)$/s.exec(message)?.[1] ?? '').split(',').length).toBeLessThanOrEqual(20);
     await assertNothingApplied();
   }, 60_000);
+
+  it('[C2-legacy] aborts when a holding assigned booking has no eligibility coverage', async () => {
+    const sentinels = await seedAt0005();
+    // Take the assignment away: 0005 allowed this state, 0006 will not create a
+    // live claim out of it.
+    await getPool().query('DELETE FROM provider_branch_assignments WHERE employee_id = $1', [
+      sentinels.employee,
+    ]);
+    const message = await migrationFailure();
+    expect(message).toContain('would become a live allocation');
+    expect(message).toContain('does not invent eligibility');
+    expect(message).toContain(sentinels.withProvider);
+    // The cancelled booking is backfilled RELEASED, so it is not the reason.
+    expect(message).not.toContain(sentinels.cancelled);
+    await assertNothingApplied();
+  });
+
+  it('[C2-legacy] aborts when the qualification is missing, and reports a bounded sample', async () => {
+    const sentinels = await seedAt0005();
+    await getPool().query('DELETE FROM provider_service_qualifications WHERE employee_id = $1', [
+      sentinels.employee,
+    ]);
+    const message = await migrationFailure();
+    expect(message).toContain('would become a live allocation');
+    expect((/Sample bookings: (.*)$/s.exec(message)?.[1] ?? '').split(',').length).toBeLessThanOrEqual(20);
+    await assertNothingApplied();
+  });
 
   it('[R6b] validates the buffer bounds once the data is clean', async () => {
     await seedAt0005();

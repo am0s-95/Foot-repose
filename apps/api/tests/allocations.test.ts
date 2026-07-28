@@ -212,7 +212,7 @@ describe('what PostgreSQL refuses', () => {
       'SELECT occupancy::text FROM booking_provider_allocations WHERE booking_id = $1',
       [moving],
     );
-    // A free slot: the claim follows.
+    // A free slot INSIDE the provider's coverage: the claim follows.
     await getPool().query(
       "UPDATE bookings SET starts_at = starts_at + interval '2 hours', ends_at = ends_at + interval '2 hours' WHERE id = $1",
       [moving],
@@ -232,6 +232,164 @@ describe('what PostgreSQL refuses', () => {
         ),
       ),
     ).toBe('23P01');
+  });
+
+  describe('a reschedule must stay inside eligibility [C2-reschedule]', () => {
+    /** Everything that must be identical after a refused reschedule. */
+    const snapshot = async (bookingId: string): Promise<string> =>
+      JSON.stringify(
+        (
+          await getPool().query(
+            `SELECT (SELECT row_to_json(b) FROM bookings b WHERE b.id = $1) AS booking,
+                    (SELECT json_agg(row_to_json(p) ORDER BY p.allocation_seq)
+                       FROM booking_provider_allocations p WHERE p.booking_id = $1) AS providers,
+                    (SELECT json_agg(row_to_json(r) ORDER BY r.allocation_seq)
+                       FROM booking_resource_allocations r WHERE r.booking_id = $1) AS resources`,
+            [bookingId],
+          )
+        ).rows[0],
+      );
+
+    const allocated = async (): Promise<string> => {
+      const id = await book({ hour: 10 });
+      await captureBookingRequirements(getPool(), id);
+      await allocateBooking(getPool(), id, {
+        employeeId: fx.staffA.id,
+        resourceIds: [fx.chairA1],
+      });
+      return id;
+    };
+
+    it('accepts a reschedule that stays inside assignment and qualification', async () => {
+      const booking = await allocated();
+      // 2030-04-07 -> 2030-04-09, both inside the open-ended dated rows.
+      await getPool().query(
+        "UPDATE bookings SET starts_at = starts_at + interval '2 days', ends_at = ends_at + interval '2 days' WHERE id = $1",
+        [booking],
+      );
+      const row = await getPool().query<{ same: boolean }>(
+        `SELECT lower(p.occupancy) = b.starts_at AS same
+         FROM booking_provider_allocations p JOIN bookings b ON b.id = p.booking_id
+         WHERE p.booking_id = $1`,
+        [booking],
+      );
+      expect(row.rows[0]!.same).toBe(true);
+    });
+
+    it('rejects a reschedule that lands outside the branch assignment', async () => {
+      const booking = await allocated();
+      // Close the assignment before the new date, leaving the current one covered.
+      await getPool().query(
+        `UPDATE provider_branch_assignments
+            SET valid_dates = daterange(lower(valid_dates), '2030-05-01'::date, '[)')
+          WHERE employee_id = $1 AND branch_id = $2`,
+        [fx.staffA.id, fx.branchA],
+      );
+      const before = await snapshot(booking);
+      expect(
+        await sqlstateOf(() =>
+          getPool().query(
+            "UPDATE bookings SET starts_at = starts_at + interval '60 days', ends_at = ends_at + interval '60 days' WHERE id = $1",
+            [booking],
+          ),
+        ),
+      ).toBe('P0001');
+      // The booking AND every claim are exactly as they were.
+      expect(await snapshot(booking)).toBe(before);
+    });
+
+    it('rejects a reschedule that lands outside the service qualification', async () => {
+      const booking = await allocated();
+      await getPool().query(
+        `UPDATE provider_service_qualifications
+            SET valid_dates = daterange(lower(valid_dates), '2030-05-01'::date, '[)')
+          WHERE employee_id = $1 AND service_id = $2`,
+        [fx.staffA.id, fx.service],
+      );
+      const before = await snapshot(booking);
+      expect(
+        await sqlstateOf(() =>
+          getPool().query(
+            "UPDATE bookings SET starts_at = starts_at + interval '60 days', ends_at = ends_at + interval '60 days' WHERE id = $1",
+            [booking],
+          ),
+        ),
+      ).toBe('P0001');
+      expect(await snapshot(booking)).toBe(before);
+    });
+
+    it('leaves no uncovered claim and rolls the resource claim back too', async () => {
+      const booking = await allocated();
+      await getPool().query(
+        `UPDATE provider_branch_assignments
+            SET valid_dates = daterange(lower(valid_dates), '2030-05-01'::date, '[)')
+          WHERE employee_id = $1 AND branch_id = $2`,
+        [fx.staffA.id, fx.branchA],
+      );
+      await sqlstateOf(() =>
+        getPool().query(
+          "UPDATE bookings SET starts_at = starts_at + interval '60 days', ends_at = ends_at + interval '60 days' WHERE id = $1",
+          [booking],
+        ),
+      );
+      const state = await getPool().query<{ resource_claims: number; uncovered: number }>(
+        `SELECT (SELECT count(*)::int FROM booking_resource_allocations
+                  WHERE booking_id = $1 AND released_at IS NULL) AS resource_claims,
+                (SELECT count(*)::int
+                   FROM booking_provider_allocations a
+                   JOIN bookings b ON b.id = a.booking_id
+                   CROSS JOIN LATERAL (
+                     SELECT (lower(a.occupancy) AT TIME ZONE 'Asia/Muscat')::date AS d
+                     UNION
+                     SELECT ((upper(a.occupancy) - interval '1 microsecond')
+                              AT TIME ZONE 'Asia/Muscat')::date
+                   ) dates
+                   WHERE a.released_at IS NULL
+                     AND NOT EXISTS (SELECT 1 FROM provider_branch_assignments pa
+                                      WHERE pa.employee_id = a.employee_id
+                                        AND pa.branch_id = a.branch_id
+                                        AND pa.valid_dates @> dates.d)) AS uncovered`,
+        [booking],
+      );
+      expect(state.rows[0]!.resource_claims).toBe(1);
+      expect(state.rows[0]!.uncovered).toBe(0);
+    });
+
+    it('lets a reschedule through once the assignment is extended to cover it', async () => {
+      const booking = await allocated();
+      await getPool().query(
+        `UPDATE provider_branch_assignments
+            SET valid_dates = daterange(lower(valid_dates), '2030-05-01'::date, '[)')
+          WHERE employee_id = $1 AND branch_id = $2`,
+        [fx.staffA.id, fx.branchA],
+      );
+      expect(
+        await sqlstateOf(() =>
+          getPool().query(
+            "UPDATE bookings SET starts_at = starts_at + interval '60 days', ends_at = ends_at + interval '60 days' WHERE id = $1",
+            [booking],
+          ),
+        ),
+      ).toBe('P0001');
+      // Re-open the assignment; now the same move is legitimate.
+      await getPool().query(
+        `UPDATE provider_branch_assignments
+            SET valid_dates = daterange(lower(valid_dates), NULL, '[)')
+          WHERE employee_id = $1 AND branch_id = $2`,
+        [fx.staffA.id, fx.branchA],
+      );
+      await getPool().query(
+        "UPDATE bookings SET starts_at = starts_at + interval '60 days', ends_at = ends_at + interval '60 days' WHERE id = $1",
+        [booking],
+      );
+      const row = await getPool().query<{ same: boolean }>(
+        `SELECT lower(p.occupancy) = b.starts_at AS same
+         FROM booking_provider_allocations p JOIN bookings b ON b.id = p.booking_id
+         WHERE p.booking_id = $1`,
+        [booking],
+      );
+      expect(row.rows[0]!.same).toBe(true);
+    });
   });
 
   it('[+1] derives the same occupancy in SQL and in the domain', async () => {

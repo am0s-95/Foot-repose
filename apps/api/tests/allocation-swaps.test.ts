@@ -468,6 +468,113 @@ describe('two concurrent calls to the swap itself', () => {
     expect(await uncoveredClaims(booking)).toBe(0);
   }, 30_000);
 
+  /**
+   * [C2-reschedule] The claim can move as well as the evidence.
+   *
+   * Under EITHER commit order the end state must have no uncovered live claim:
+   * whichever transaction goes second sees the other's committed state and is
+   * refused — the reschedule by the allocation guard, the eligibility change by
+   * the coverage guard.
+   */
+  async function rescheduleVersusEligibility(
+    order: 'reschedule-first' | 'eligibility-first',
+  ): Promise<{ uncovered: number; deadlocks: number; outcomes: string[] }> {
+    const pool = getPool();
+    const booking = await makeBooking({
+      branchId: fx.branchA,
+      isoDate: DATE,
+      hour: 10,
+      serviceId: fx.service,
+      customerId: fx.customerOne,
+    });
+    await captureBookingRequirements(pool, booking);
+    await allocateBooking(pool, booking, {
+      employeeId: fx.staffA.id,
+      resourceIds: [fx.chairA1],
+    });
+
+    const first = await pool.connect();
+    const second = await pool.connect();
+    const run = (
+      client: typeof first,
+      what: 'reschedule' | 'eligibility',
+    ): Promise<string> =>
+      (what === 'reschedule'
+        ? client.query(
+            "UPDATE bookings SET starts_at = starts_at + interval '60 days', ends_at = ends_at + interval '60 days' WHERE id = $1",
+            [booking],
+          )
+        : client.query(
+            `UPDATE provider_branch_assignments
+                SET valid_dates = daterange(lower(valid_dates), '2030-05-01'::date, '[)')
+              WHERE employee_id = $1 AND branch_id = $2`,
+            [fx.staffA.id, fx.branchA],
+          )
+      ).then(
+        () => 'applied',
+        (error: { code?: string }) => error.code ?? 'unknown',
+      );
+
+    const outcomes: string[] = [];
+    try {
+      // Captured BEFORE anything blocks: asking a busy connection for its pid
+      // queues behind the statement we are waiting on.
+      const secondPid = await backendPid(second);
+      const [a, b] =
+        order === 'reschedule-first'
+          ? (['reschedule', 'eligibility'] as const)
+          : (['eligibility', 'reschedule'] as const);
+      await first.query('BEGIN');
+      outcomes.push(await run(first, a));
+      await second.query('BEGIN');
+      const pending = run(second, b);
+      await waitUntilBlockedBy(pool, secondPid, 3_000);
+      const firstOk = outcomes[0] === 'applied';
+      await first.query(firstOk ? 'COMMIT' : 'ROLLBACK');
+      const secondOutcome = await pending;
+      outcomes.push(secondOutcome);
+      await second.query(secondOutcome === 'applied' ? 'COMMIT' : 'ROLLBACK').catch(() => undefined);
+    } finally {
+      first.release();
+      second.release();
+    }
+
+    const uncovered = await pool.query<{ n: number }>(
+      `SELECT count(*)::int AS n
+       FROM booking_provider_allocations a
+       JOIN bookings b ON b.id = a.booking_id
+       CROSS JOIN LATERAL (
+         SELECT (lower(a.occupancy) AT TIME ZONE 'Asia/Muscat')::date AS d
+         UNION
+         SELECT ((upper(a.occupancy) - interval '1 microsecond') AT TIME ZONE 'Asia/Muscat')::date
+       ) dates
+       WHERE a.released_at IS NULL
+         AND (NOT EXISTS (SELECT 1 FROM provider_branch_assignments pa
+                           WHERE pa.employee_id = a.employee_id AND pa.branch_id = a.branch_id
+                             AND pa.valid_dates @> dates.d)
+           OR NOT EXISTS (SELECT 1 FROM provider_service_qualifications q
+                           WHERE q.employee_id = a.employee_id AND q.service_id = b.service_id
+                             AND q.valid_dates @> dates.d))`,
+    );
+    return {
+      uncovered: uncovered.rows[0]!.n,
+      deadlocks: outcomes.filter((o) => o === '40P01').length,
+      outcomes,
+    };
+  }
+
+  it('[C2-reschedule] reschedule first, then the eligibility change: no uncovered claim', async () => {
+    const result = await rescheduleVersusEligibility('reschedule-first');
+    expect(result.uncovered).toBe(0);
+    expect(result.deadlocks).toBe(0);
+  }, 30_000);
+
+  it('[C2-reschedule] eligibility change first, then the reschedule: no uncovered claim', async () => {
+    const result = await rescheduleVersusEligibility('eligibility-first');
+    expect(result.uncovered).toBe(0);
+    expect(result.deadlocks).toBe(0);
+  }, 30_000);
+
   it('[11] two concurrent allocations of the same provider: exactly one succeeds', async () => {
     const pool = getPool();
     const first = await makeBooking({

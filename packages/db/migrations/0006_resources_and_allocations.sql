@@ -547,6 +547,91 @@ create trigger fr_qualification_coverage_delete_guard
   referencing old table as fr_old_rows
   for each statement execute function fr_eligibility_delete_guard();
 
+-- The other direction of the same invariant: the CLAIM can move too.
+--
+-- Rescheduling a booking rewrites `starts_at`/`ends_at`, and the composite FK
+-- cascades that into every live claim's mirrors, which regenerates `occupancy`.
+-- Guarding only the eligibility tables would therefore leave an obvious hole: a
+-- booking moved to a date outside the provider's assignment or qualification
+-- commits happily (no time conflict) and leaves a live claim nobody is eligible
+-- for. Rescheduling is a daily operation, so this is not a theoretical gap.
+--
+-- Row level, because each claim is judged on its own window, and AFTER so that
+-- the generated `occupancy` is the FINAL one — the guard reads the NEW window,
+-- never the old. Raising here aborts the whole statement, so the booking UPDATE
+-- and every provider/resource cascade roll back together.
+--
+-- The covering rows are locked FOR SHARE, exactly as `allocateBooking` locks
+-- them, so a concurrent eligibility change cannot slip past in either order.
+create function fr_allocation_eligibility_guard() returns trigger
+  language plpgsql as $fn$
+declare
+  service uuid;
+  needed integer;
+  assigned integer;
+  qualified integer;
+begin
+  -- A released claim is history: it neither holds capacity nor needs current
+  -- eligibility.
+  if new.released_at is not null then return null; end if;
+
+  -- Nothing that matters changed (a pure release-metadata or bookkeeping
+  -- UPDATE): the window, the branch and the provider are all identical.
+  if tg_op = 'UPDATE'
+     and old.released_at is null
+     and new.occupancy = old.occupancy
+     and new.branch_id = old.branch_id
+     and new.employee_id = old.employee_id then
+    return null;
+  end if;
+
+  select b.service_id into service from bookings b where b.id = new.booking_id;
+
+  select count(*) into needed from (
+    select (lower(new.occupancy) at time zone 'Asia/Muscat')::date as d
+    union
+    select ((upper(new.occupancy) - interval '1 microsecond') at time zone 'Asia/Muscat')::date
+  ) dates;
+
+  select count(distinct s.d) into assigned from (
+    select dd.d
+    from (select (lower(new.occupancy) at time zone 'Asia/Muscat')::date as d
+          union
+          select ((upper(new.occupancy) - interval '1 microsecond') at time zone 'Asia/Muscat')::date) dd
+    join provider_branch_assignments a
+      on a.employee_id = new.employee_id and a.branch_id = new.branch_id
+     and a.valid_dates @> dd.d
+    for share of a
+  ) s;
+
+  select count(distinct s.d) into qualified from (
+    select dd.d
+    from (select (lower(new.occupancy) at time zone 'Asia/Muscat')::date as d
+          union
+          select ((upper(new.occupancy) - interval '1 microsecond') at time zone 'Asia/Muscat')::date) dd
+    join provider_service_qualifications q
+      on q.employee_id = new.employee_id and q.service_id = service
+     and q.valid_dates @> dd.d
+    for share of q
+  ) s;
+
+  if assigned <> needed then
+    raise exception
+      'provider % is not assigned to branch % for every Muscat date of booking %''s window %',
+      new.employee_id, new.branch_id, new.booking_id, new.occupancy;
+  end if;
+  if qualified <> needed then
+    raise exception
+      'provider % is not qualified for the service of booking % for every Muscat date of window %',
+      new.employee_id, new.booking_id, new.occupancy;
+  end if;
+  return null;
+end $fn$;
+
+create trigger fr_provider_allocation_eligibility_guard
+  after insert or update on booking_provider_allocations
+  for each row execute function fr_allocation_eligibility_guard();
+
 -- TRUNCATE does not fire DELETE triggers, so the guard above is blind to it —
 -- and the development seed truncates through the same DATABASE_URL. A
 -- statement-level BEFORE TRUNCATE trigger closes that, including for tables
@@ -590,6 +675,8 @@ declare
   long_ids text;
   overlap_count integer;
   overlap_pairs text;
+  uncovered_count integer;
+  uncovered_ids text;
 begin
   -- The count is over EVERY violating row; only the SAMPLE is capped. Counting
   -- after a LIMIT would report "20" for a database with hundreds of problems
@@ -650,6 +737,61 @@ begin
       'migration 0006 preflight: % pre-existing provider double-booking(s) found; '
       'these must be resolved by hand — 0006 will not release, drop or rewrite either side. Pairs: %',
       overlap_count, overlap_pairs;
+  end if;
+
+  -- The backfill turns assigned_employee_id into a LIVE claim, and a live claim
+  -- must be eligible — the same rule the runtime guard enforces from here on.
+  -- Eligibility rows are NOT invented, claims are NOT released and history is
+  -- NOT rewritten: a database that cannot satisfy the rule is reported and the
+  -- migration aborts so an operator can decide.
+  select count(*) into uncovered_count
+  from bookings b
+  cross join lateral (
+    select ((b.starts_at - make_interval(mins => b.buffer_before_min_snapshot))
+             at time zone 'Asia/Muscat')::date as d
+    union
+    select ((b.ends_at + make_interval(mins => b.buffer_after_min_snapshot)
+             - interval '1 microsecond') at time zone 'Asia/Muscat')::date
+  ) dates
+  where b.assigned_employee_id is not null
+    and b.status in ('confirmed', 'checked_in', 'in_service', 'completed')
+    and (not exists (select 1 from provider_branch_assignments a
+                      where a.employee_id = b.assigned_employee_id
+                        and a.branch_id = b.branch_id and a.valid_dates @> dates.d)
+      or not exists (select 1 from provider_service_qualifications q
+                      where q.employee_id = b.assigned_employee_id
+                        and q.service_id = b.service_id and q.valid_dates @> dates.d));
+
+  select string_agg(id::text, ', ' order by id) into uncovered_ids
+  from (
+    select distinct b.id
+    from bookings b
+    cross join lateral (
+      select ((b.starts_at - make_interval(mins => b.buffer_before_min_snapshot))
+               at time zone 'Asia/Muscat')::date as d
+      union
+      select ((b.ends_at + make_interval(mins => b.buffer_after_min_snapshot)
+               - interval '1 microsecond') at time zone 'Asia/Muscat')::date
+    ) dates
+    where b.assigned_employee_id is not null
+      and b.status in ('confirmed', 'checked_in', 'in_service', 'completed')
+      and (not exists (select 1 from provider_branch_assignments a
+                        where a.employee_id = b.assigned_employee_id
+                          and a.branch_id = b.branch_id and a.valid_dates @> dates.d)
+        or not exists (select 1 from provider_service_qualifications q
+                        where q.employee_id = b.assigned_employee_id
+                          and q.service_id = b.service_id and q.valid_dates @> dates.d))
+    order by b.id limit 20
+  ) s;
+
+  if uncovered_count > 0 then
+    raise exception
+      'migration 0006 preflight: % booking/date pair(s) would become a live allocation whose '
+      'provider has no branch assignment or service qualification on that Muscat date. '
+      '0006 does not invent eligibility, release claims or rewrite history — add the missing '
+      'provider_branch_assignments / provider_service_qualifications rows, or clear the '
+      'assignment on those bookings, then re-run. Sample bookings: %',
+      uncovered_count, uncovered_ids;
   end if;
 end $preflight$;
 
