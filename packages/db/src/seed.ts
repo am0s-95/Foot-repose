@@ -90,7 +90,12 @@ try {
   await runMigrations(pool);
   const summary = await withTransaction(pool, async (tx) => {
     await tx.query(
-      'TRUNCATE audit_logs, login_rate_limits, sessions, bookings, branch_service_offerings, customers, services, employee_branches, employees, branches RESTART IDENTITY CASCADE',
+      `TRUNCATE audit_logs, login_rate_limits, sessions, bookings,
+                branch_hours_override_windows, branch_hours_overrides, branch_weekly_windows,
+                provider_extra_shifts, provider_weekly_windows,
+                provider_service_qualifications, provider_branch_assignments,
+                branch_service_offerings, customers, services,
+                employee_branches, employees, branches RESTART IDENTITY CASCADE`,
     );
 
     // ---- branches ----
@@ -139,12 +144,15 @@ try {
     };
 
     await insertEmployee('hq.admin@footrepose.example', 'Hilal Al-Kharusi', 'super_admin', []);
+    const managerIds: string[] = [];
     for (const [i, branch] of BRANCHES.entries()) {
-      await insertEmployee(
-        `manager.${branch.code.toLowerCase()}@footrepose.example`,
-        fictionalName(),
-        'branch_manager',
-        [branchIds[i]!],
+      managerIds.push(
+        await insertEmployee(
+          `manager.${branch.code.toLowerCase()}@footrepose.example`,
+          fictionalName(),
+          'branch_manager',
+          [branchIds[i]!],
+        ),
       );
     }
 
@@ -250,6 +258,155 @@ try {
       }
     }
 
+    // ---- scheduling inputs: FICTIONAL hours and shifts ----
+    // The real branches' opening hours and rosters are business data entered
+    // later; nothing here is a claim about them. What the shapes DO prove is
+    // that the model carries dated versions, a midnight-crossing window, the
+    // day-owning override, and cross-branch provider work.
+    const scheduleFrom = addDaysToIsoDate(today, -30);
+    const scheduleHistoryFrom = addDaysToIsoDate(today, -120);
+    const tomorrow = addDaysToIsoDate(today, 1);
+    let scheduleRows = 0;
+
+    const insertBranchWindow = async (
+      branchId: string,
+      validFrom: string,
+      validTo: string | null,
+      dayOfWeek: number,
+      openMinute: number,
+      closeMinute: number,
+    ): Promise<void> => {
+      await tx.query(
+        `INSERT INTO branch_weekly_windows
+           (branch_id, valid_dates, day_of_week, open_minute, close_minute)
+         VALUES ($1, daterange($2::date, $3::date, '[)'), $4, $5, $6)`,
+        [branchId, validFrom, validTo, dayOfWeek, openMinute, closeMinute],
+      );
+      scheduleRows += 1;
+    };
+
+    for (const [i, branchId] of branchIds.entries()) {
+      const code = BRANCHES[i]!.code;
+      for (let dow = 0; dow < 7; dow += 1) {
+        // Friday opens late; Muttrah keeps a Saturday night window that runs
+        // past midnight — the cyclic-week wrap the schema has to police.
+        const [open, close] =
+          code === 'MTR' && dow === 6 ? [600, 1500] : dow === 5 ? [840, 1320] : [600, 1320];
+        await insertBranchWindow(branchId, scheduleFrom, null, dow, open, close);
+      }
+      if (code === 'KHW') {
+        // superseded version: the branch used to open an hour earlier
+        for (let dow = 0; dow < 7; dow += 1) {
+          await insertBranchWindow(branchId, scheduleHistoryFrom, scheduleFrom, dow, 540, 1260);
+        }
+      }
+    }
+
+    // Day overrides: one branch shut tomorrow, one open on shortened hours.
+    await tx.query(
+      `INSERT INTO branch_hours_overrides (branch_id, muscat_date, is_closed, note)
+       VALUES ($1, $2::date, true, 'fictional maintenance day')`,
+      [branchIds[0]!, tomorrow],
+    );
+    const overrideOpen = await tx.query<{ id: string }>(
+      `INSERT INTO branch_hours_overrides (branch_id, muscat_date, is_closed, note)
+       VALUES ($1, $2::date, false, 'fictional shortened day') RETURNING id`,
+      [branchIds[1]!, tomorrow],
+    );
+    await tx.query(
+      `INSERT INTO branch_hours_override_windows
+         (override_id, header_is_closed, open_minute, close_minute)
+       VALUES ($1, false, 960, 1200)`,
+      [overrideOpen.rows[0]!.id],
+    );
+    scheduleRows += 3;
+
+    // Operational branch assignment for every manager and staff member.
+    const assign = async (employeeId: string, branchId: string): Promise<void> => {
+      await tx.query(
+        `INSERT INTO provider_branch_assignments (employee_id, branch_id, valid_dates)
+         VALUES ($1, $2, daterange($3::date, NULL, '[)'))`,
+        [employeeId, branchId, scheduleFrom],
+      );
+      scheduleRows += 1;
+    };
+
+    // Weekly shifts + breaks, batched per provider. Two rosters that never
+    // overlap for the same person, in any branch.
+    const ROSTERS = [
+      { days: [0, 1, 2, 3, 4], open: 600, close: 1080, breakOpen: 780, breakClose: 810 },
+      { days: [6, 0, 1, 2, 3], open: 840, close: 1320, breakOpen: 1020, breakClose: 1050 },
+    ] as const;
+    const insertWeeklyWindows = async (
+      employeeId: string,
+      rows: { branchId: string; kind: 'shift' | 'break'; dow: number; open: number; close: number }[],
+    ): Promise<void> => {
+      const values: unknown[] = [];
+      const tuples = rows.map((row) => {
+        const n = values.length;
+        values.push(employeeId, row.branchId, row.kind, scheduleFrom, row.dow, row.open, row.close);
+        return `($${n + 1}, $${n + 2}, $${n + 3}, daterange($${n + 4}::date, NULL, '[)'), $${n + 5}, $${n + 6}, $${n + 7})`;
+      });
+      await tx.query(
+        `INSERT INTO provider_weekly_windows
+           (employee_id, branch_id, kind, valid_dates, day_of_week, open_minute, close_minute)
+         VALUES ${tuples.join(', ')}`,
+        values,
+      );
+      scheduleRows += rows.length;
+    };
+
+    const floaterOf = new Map<string, string>(); // staff id -> neighbouring branch
+    for (let i = 0; i < 3; i += 1) {
+      floaterOf.set(staffByBranch.get(branchIds[i]!)![0]!, branchIds[(i + 1) % branchIds.length]!);
+    }
+
+    for (const [branchIndex, branchId] of branchIds.entries()) {
+      const staff = staffByBranch.get(branchId)!;
+      await assign(managerIds[branchIndex]!, branchId);
+      for (const [staffIndex, staffId] of staff.entries()) {
+        await assign(staffId, branchId);
+        const roster = ROSTERS[staffIndex % ROSTERS.length]!;
+        const rows: {
+          branchId: string;
+          kind: 'shift' | 'break';
+          dow: number;
+          open: number;
+          close: number;
+        }[] = roster.days.flatMap((dow) => [
+          { branchId, kind: 'shift' as const, dow, open: roster.open, close: roster.close },
+          { branchId, kind: 'break' as const, dow, open: roster.breakOpen, close: roster.breakClose },
+        ]);
+        const neighbour = floaterOf.get(staffId);
+        if (neighbour) {
+          // Friday is off in both rosters, so the cross-branch shift cannot
+          // collide with the home one.
+          await assign(staffId, neighbour);
+          rows.push({ branchId: neighbour, kind: 'shift', dow: 5, open: 840, close: 1200 });
+        }
+        await insertWeeklyWindows(staffId, rows);
+        for (const service of services.slice(0, 4)) {
+          await tx.query(
+            `INSERT INTO provider_service_qualifications (employee_id, service_id, valid_dates)
+             VALUES ($1, $2, daterange($3::date, NULL, '[)'))`,
+            [staffId, service.id, scheduleFrom],
+          );
+          scheduleRows += 1;
+        }
+      }
+    }
+
+    // Two concrete extra shifts tomorrow: they OVERRIDE the weekly roster for
+    // the minutes they cover, which is how one provider stays in one branch.
+    for (const [staffId, neighbour] of [...floaterOf.entries()].slice(0, 2)) {
+      await tx.query(
+        `INSERT INTO provider_extra_shifts (employee_id, branch_id, during, note)
+         VALUES ($1, $2, tstzrange($3, $4, '[)'), 'fictional cover shift')`,
+        [staffId, neighbour, muscatDateTimeToUtc(tomorrow, 11), muscatDateTimeToUtc(tomorrow, 13)],
+      );
+      scheduleRows += 1;
+    }
+
     // ---- customers (obviously fictional phone block) ----
     const customerIds: string[] = [];
     for (let i = 0; i < CUSTOMER_COUNT; i += 1) {
@@ -341,6 +498,7 @@ try {
           employees: employeeCount,
           customers: customerIds.length,
           bookings: bookingCount,
+          scheduleRows,
           seededFor: today,
         }),
       ],
@@ -352,6 +510,7 @@ try {
       customers: customerIds.length,
       bookings: bookingCount,
       offerings: offeringCount,
+      scheduleRows,
       today,
     };
   });
@@ -360,6 +519,7 @@ try {
   console.log(
     `  ${summary.branches} branches, ${summary.employees} employees, ${summary.customers} customers, ${summary.bookings} bookings, ${summary.offerings} offerings`,
   );
+  console.log(`  ${summary.scheduleRows} scheduling-input rows (branch hours, assignments, shifts)`);
   console.log('  Sample logins (password for all: FootRepose!Dev1):');
   console.log('    super admin -> hq.admin@footrepose.example');
   console.log('    manager     -> manager.khw@footrepose.example');

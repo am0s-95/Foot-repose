@@ -102,6 +102,42 @@ a frontend imports database/server modules (bare specifiers or relative
 paths into `apps/api`/`packages/db`), when `domain` gains any dependency
 (imports or its package.json), or when `contracts` touches the database.
 
+## Scheduling inputs (slice 2A.2a)
+
+Migration `0005` adds the *inputs* a scheduling engine will later read.
+There is no engine, no availability endpoint and no UI yet — on purpose.
+
+- `branch_weekly_windows` / `provider_weekly_windows` — dated weekly
+  templates. A window may cross midnight; the cyclic week (including the
+  Saturday → Sunday wrap) is policed by PostgreSQL through a generated
+  `int4multirange` and a GiST exclusion constraint. `branch_id` is
+  deliberately **outside** the provider key, so one provider's shifts can
+  never overlap even across two branches.
+- `branch_hours_overrides` (+ `branch_hours_override_windows`) — a
+  Muscat-day override owns every minute of its day. A window under a closed
+  day is impossible by composite foreign key, override windows never cross
+  midnight, and past days are immutable history.
+- `provider_branch_assignments`, `provider_service_qualifications`,
+  `provider_extra_shifts` — dated operational assignment, dated
+  qualification, and concrete extra shifts in UTC instants.
+
+Two rules the database cannot express live in `@foot-repose/domain`
+(`materializeBranchHours`, `materializeProviderPresence`) and are tested in
+both directions:
+
+- **Version-boundary carry-in** — each dated version owns the minutes of
+  its own dates, so a midnight-crossing window is clipped at a version
+  boundary instead of leaking into the next version's day.
+- **An extra shift overrides the weekly template** for the minutes it
+  covers rather than adding to it. That is what keeps one provider from
+  appearing available in two branches at the same instant while leaving no
+  gap in total coverage.
+
+A break must lie inside one of that provider's shifts. That containment
+crosses rows of a single table, so it is validated in the write path
+(`insertProviderWeeklyWindow`) and asserted over the seed; its failure
+direction is safe — a stray break only ever removes availability.
+
 ## Checks
 
 ```bash
