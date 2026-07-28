@@ -217,12 +217,21 @@ scheduling table are **not** protected and keep their current behaviour. Real
 enforcement needs an application role separate from the migration role, which
 this codebase does not have today.
 
+Eligibility is enforced from both ends. Allocation reads the covering
+assignment and qualification rows `FOR SHARE` — the rows it returns *are* the
+evidence, so a concurrent change cannot slip between the check and the write.
+And because a lock only protects the moment of allocation, a statement-level
+guard re-examines any `UPDATE`/`DELETE` of `provider_branch_assignments` or
+`provider_service_qualifications` against the state it produces: if it would
+leave a live claim by a provider who is no longer assigned or qualified, it is
+rejected. Transition tables are used deliberately, so a multi-row statement is
+judged on the complete post-statement state rather than row by row, and both the
+old and the new keys are considered.
+
 Repository guarantees (not constraints), each re-proved over the seed by
 anti-join, each with a safe failure direction:
 
-- eligibility — active branch, active employee, dated branch assignment and
-  dated service qualification, read `FOR SHARE` so a concurrent change cannot
-  slip between the check and the write;
+- active branch and active employee, checked under lock at allocation time;
 - requirement satisfaction — an exact multiset, which is a set property no row
   constraint can state;
 - release on a status that stops holding capacity, as one atomic operation with

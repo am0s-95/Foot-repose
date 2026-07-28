@@ -265,17 +265,51 @@ describe('two concurrent calls to the swap itself', () => {
   }, 30_000);
 
   /**
-   * [C2] The rows that PROVE eligibility are the rows that get locked.
+   * [C2] Eligibility has to STAY true for as long as the claim is live.
    *
-   * The earlier shape locked the candidate rows in one statement and counted
-   * coverage in a second: a row that was not a candidate (so never locked) could
-   * be updated into coverage between them, counted, and moved back out before
-   * commit. Now one statement returns the covering rows AND locks them, so a
-   * concurrent writer must wait for the allocation to finish.
+   * Locking the evidence rows only protects the moment of allocation: the very
+   * same mutation could commit a heartbeat later and leave a live claim by a
+   * provider who is no longer assigned or qualified. So the mutation is judged
+   * against the state it produces, by a statement-level guard.
+   *
+   * The race is deterministic: the allocator holds its transaction open, the
+   * writer is PROVEN blocked on it (pg_blocking_pids for that exact backend),
+   * and only then does the allocator commit.
    */
+  interface RaceOutcome {
+    blockedByAllocator: boolean;
+    writerError: string;
+    liveClaims: number;
+    uncoveredClaims: number;
+  }
+
+  /** Live claims of this booking whose provider lacks assignment or
+   * qualification on any Muscat date the claim occupies. Must always be 0. */
+  async function uncoveredClaims(bookingId: string): Promise<number> {
+    const rows = await getPool().query<{ n: number }>(
+      `SELECT count(*)::int AS n
+       FROM booking_provider_allocations a
+       JOIN bookings b ON b.id = a.booking_id
+       CROSS JOIN LATERAL (
+         SELECT (lower(a.occupancy) AT TIME ZONE 'Asia/Muscat')::date AS d
+         UNION
+         SELECT ((upper(a.occupancy) - interval '1 microsecond') AT TIME ZONE 'Asia/Muscat')::date
+       ) dates
+       WHERE a.booking_id = $1 AND a.released_at IS NULL
+         AND (NOT EXISTS (SELECT 1 FROM provider_branch_assignments pa
+                           WHERE pa.employee_id = a.employee_id AND pa.branch_id = a.branch_id
+                             AND pa.valid_dates @> dates.d)
+           OR NOT EXISTS (SELECT 1 FROM provider_service_qualifications q
+                           WHERE q.employee_id = a.employee_id AND q.service_id = b.service_id
+                             AND q.valid_dates @> dates.d))`,
+      [bookingId],
+    );
+    return rows.rows[0]!.n;
+  }
+
   async function eligibilityRace(
-    mutate: (client: { query: (sql: string, values?: unknown[]) => Promise<unknown> }) => Promise<unknown>,
-  ): Promise<{ blockedByAllocator: boolean; liveClaims: number }> {
+    mutation: { sql: string; values: unknown[] },
+  ): Promise<RaceOutcome> {
     const pool = getPool();
     const booking = await makeBooking({
       branchId: fx.branchA,
@@ -297,56 +331,141 @@ describe('two concurrent calls to the swap itself', () => {
         resourceIds: [fx.chairA1],
       });
 
-      // The writer tries to move the evidence out of coverage while the
-      // allocation is still open. It must block on the row the allocator locked.
       await writer.query('BEGIN');
-      const pending = mutate(writer).then(
-        () => 'done',
-        () => 'failed',
+      const pending = writer.query(mutation.sql, mutation.values).then(
+        () => 'no error',
+        (error: { code?: string; message?: string }) =>
+          error.code === 'P0001' ? 'rejected' : (error.code ?? error.message ?? 'unknown'),
       );
       const blockers = await waitUntilBlockedBy(pool, writerPid);
       const blockedByAllocator = blockers.includes(allocatorPid);
 
       await allocator.query('COMMIT');
-      await pending;
-      await writer.query('COMMIT');
+      const writerError = await pending;
+      // Whatever the writer attempted, it must not be able to keep it.
+      await writer.query(writerError === 'no error' ? 'COMMIT' : 'ROLLBACK').catch(() => undefined);
 
       const live = await pool.query<{ n: number }>(
         `SELECT count(*)::int AS n FROM booking_provider_allocations
          WHERE booking_id = $1 AND released_at IS NULL`,
         [booking],
       );
-      return { blockedByAllocator, liveClaims: live.rows[0]!.n };
+      return {
+        blockedByAllocator,
+        writerError,
+        liveClaims: live.rows[0]!.n,
+        uncoveredClaims: await uncoveredClaims(booking),
+      };
     } finally {
       allocator.release();
       writer.release();
     }
   }
 
-  it('[C2] a branch assignment cannot be moved out of coverage mid-allocation', async () => {
-    const result = await eligibilityRace((client) =>
-      client.query(
-        `UPDATE provider_branch_assignments
-            SET valid_dates = daterange('2029-01-01'::date, '2029-06-01'::date, '[)')
-          WHERE employee_id = $1 AND branch_id = $2`,
-        [fx.staffA.id, fx.branchA],
-      ),
-    );
+  it('[C2] a branch assignment moved out of coverage blocks, then is REJECTED', async () => {
+    const result = await eligibilityRace({
+      sql: `UPDATE provider_branch_assignments
+               SET valid_dates = daterange('2029-01-01'::date, '2029-06-01'::date, '[)')
+             WHERE employee_id = $1 AND branch_id = $2`,
+      values: [fx.staffA.id, fx.branchA],
+    });
     expect(result.blockedByAllocator).toBe(true);
+    expect(result.writerError).toBe('rejected');
     expect(result.liveClaims).toBe(1);
+    expect(result.uncoveredClaims).toBe(0);
   }, 30_000);
 
-  it('[C2] a service qualification cannot be moved out of coverage mid-allocation', async () => {
-    const result = await eligibilityRace((client) =>
-      client.query(
-        `UPDATE provider_service_qualifications
-            SET valid_dates = daterange('2029-01-01'::date, '2029-06-01'::date, '[)')
-          WHERE employee_id = $1 AND service_id = $2`,
-        [fx.staffA.id, fx.service],
-      ),
-    );
+  it('[C2] deleting the assignment that justifies a live claim blocks, then is REJECTED', async () => {
+    const result = await eligibilityRace({
+      sql: 'DELETE FROM provider_branch_assignments WHERE employee_id = $1 AND branch_id = $2',
+      values: [fx.staffA.id, fx.branchA],
+    });
     expect(result.blockedByAllocator).toBe(true);
+    expect(result.writerError).toBe('rejected');
+    expect(result.uncoveredClaims).toBe(0);
+  }, 30_000);
+
+  it('[C2] a qualification moved out of coverage blocks, then is REJECTED', async () => {
+    const result = await eligibilityRace({
+      sql: `UPDATE provider_service_qualifications
+               SET valid_dates = daterange('2029-01-01'::date, '2029-06-01'::date, '[)')
+             WHERE employee_id = $1 AND service_id = $2`,
+      values: [fx.staffA.id, fx.service],
+    });
+    expect(result.blockedByAllocator).toBe(true);
+    expect(result.writerError).toBe('rejected');
     expect(result.liveClaims).toBe(1);
+    expect(result.uncoveredClaims).toBe(0);
+  }, 30_000);
+
+  /**
+   * Migration 0005 already forbids two OVERLAPPING assignments for one
+   * (employee, branch), so the "each row excused by its overlapping sibling"
+   * shape cannot arise on these two tables. What can arise — and what the two
+   * tests below cover — is a historical row alongside the covering one, and a
+   * single statement that removes both.
+   */
+  const addHistoricalAssignment = (): Promise<unknown> =>
+    getPool().query(
+      `INSERT INTO provider_branch_assignments (employee_id, branch_id, valid_dates)
+       VALUES ($1, $2, daterange('2028-01-01'::date, '2029-01-01'::date, '[)'))`,
+      [fx.staffA.id, fx.branchA],
+    );
+
+  it('[C2] the mutation is ALLOWED when the remaining row still provides full coverage', async () => {
+    await addHistoricalAssignment();
+    const result = await eligibilityRace({
+      sql: `DELETE FROM provider_branch_assignments
+             WHERE employee_id = $1 AND branch_id = $2 AND upper(valid_dates) = '2029-01-01'`,
+      values: [fx.staffA.id, fx.branchA],
+    });
+    expect(result.writerError).toBe('no error');
+    expect(result.liveClaims).toBe(1);
+    expect(result.uncoveredClaims).toBe(0);
+  }, 30_000);
+
+  it('[C2] a multi-row DELETE is judged on the COMPLETE post-statement state', async () => {
+    await addHistoricalAssignment();
+    // One statement, two rows in the transition table: the guard sees the state
+    // AFTER both are gone, not each row in isolation.
+    const result = await eligibilityRace({
+      sql: 'DELETE FROM provider_branch_assignments WHERE employee_id = $1 AND branch_id = $2',
+      values: [fx.staffA.id, fx.branchA],
+    });
+    expect(result.writerError).toBe('rejected');
+    expect(result.uncoveredClaims).toBe(0);
+    // And both rows survived the rollback.
+    const remaining = await getPool().query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM provider_branch_assignments WHERE employee_id = $1 AND branch_id = $2',
+      [fx.staffA.id, fx.branchA],
+    );
+    expect(remaining.rows[0]!.n).toBe(2);
+  }, 30_000);
+
+  it('[C2] when the eligibility change commits FIRST, the later allocation refuses', async () => {
+    const booking = await makeBooking({
+      branchId: fx.branchA,
+      isoDate: DATE,
+      hour: 10,
+      serviceId: fx.service,
+      customerId: fx.customerOne,
+    });
+    await captureBookingRequirements(getPool(), booking);
+    await getPool().query(
+      `UPDATE provider_branch_assignments
+          SET valid_dates = daterange('2029-01-01'::date, '2029-06-01'::date, '[)')
+        WHERE employee_id = $1 AND branch_id = $2`,
+      [fx.staffA.id, fx.branchA],
+    );
+    expect(
+      await allocationErrorOf(() =>
+        allocateBooking(getPool(), booking, {
+          employeeId: fx.staffA.id,
+          resourceIds: [fx.chairA1],
+        }),
+      ),
+    ).toBe('not_assigned_to_branch');
+    expect(await uncoveredClaims(booking)).toBe(0);
   }, 30_000);
 
   it('[11] two concurrent allocations of the same provider: exactly one succeeds', async () => {

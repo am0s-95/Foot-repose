@@ -463,6 +463,90 @@ create trigger fr_resource_allocation_history_guard
   before insert or update or delete on booking_resource_allocations
   for each row execute function fr_allocation_history_guard();
 
+-- Eligibility is not only a precondition of allocating; it has to STAY true for
+-- as long as the claim is live.
+--
+-- Locking the evidence rows during allocation stops a mutation from slipping
+-- between the check and the write, but it does not stop the very same mutation
+-- from committing a moment later and leaving a live claim by a provider who is
+-- no longer assigned or no longer qualified. Closing that needs the mutation
+-- itself to be re-examined against the state it produces.
+--
+-- Statement level with a transition table, deliberately: a multi-row UPDATE or
+-- DELETE must be judged on the COMPLETE post-statement state, not row by row —
+-- otherwise removing two overlapping assignments would pass twice, each row
+-- excused by the other. Both the OLD and the NEW keys are considered, so moving
+-- a row to a different employee is caught on both sides.
+create function fr_assert_live_allocations_eligible(employee_ids uuid[]) returns void
+  language plpgsql as $fn$
+declare offender record;
+begin
+  if employee_ids is null or cardinality(employee_ids) = 0 then return; end if;
+  select a.booking_id, a.employee_id, dates.d into offender
+  from booking_provider_allocations a
+  join bookings b on b.id = a.booking_id
+  cross join lateral (
+    select (lower(a.occupancy) at time zone 'Asia/Muscat')::date as d
+    union
+    select ((upper(a.occupancy) - interval '1 microsecond') at time zone 'Asia/Muscat')::date
+  ) dates
+  where a.released_at is null
+    and a.employee_id = any(employee_ids)
+    and (
+      not exists (select 1 from provider_branch_assignments pa
+                   where pa.employee_id = a.employee_id and pa.branch_id = a.branch_id
+                     and pa.valid_dates @> dates.d)
+      or
+      not exists (select 1 from provider_service_qualifications q
+                   where q.employee_id = a.employee_id and q.service_id = b.service_id
+                     and q.valid_dates @> dates.d)
+    )
+  limit 1;
+  if found then
+    raise exception
+      'this change would leave booking % with a live allocation by a provider who is not '
+      'assigned/qualified on %; release the allocation first',
+      offender.booking_id, offender.d;
+  end if;
+end $fn$;
+
+-- Transition tables cannot serve more than one event, so UPDATE and DELETE get
+-- one trigger each; both feed the same checker.
+create function fr_eligibility_update_guard() returns trigger
+  language plpgsql as $fn$
+begin
+  perform fr_assert_live_allocations_eligible(
+    array(select employee_id from fr_old_rows
+          union
+          select employee_id from fr_new_rows));
+  return null;
+end $fn$;
+
+create function fr_eligibility_delete_guard() returns trigger
+  language plpgsql as $fn$
+begin
+  perform fr_assert_live_allocations_eligible(array(select employee_id from fr_old_rows));
+  return null;
+end $fn$;
+
+create trigger fr_assignment_coverage_update_guard
+  after update on provider_branch_assignments
+  referencing old table as fr_old_rows new table as fr_new_rows
+  for each statement execute function fr_eligibility_update_guard();
+create trigger fr_assignment_coverage_delete_guard
+  after delete on provider_branch_assignments
+  referencing old table as fr_old_rows
+  for each statement execute function fr_eligibility_delete_guard();
+
+create trigger fr_qualification_coverage_update_guard
+  after update on provider_service_qualifications
+  referencing old table as fr_old_rows new table as fr_new_rows
+  for each statement execute function fr_eligibility_update_guard();
+create trigger fr_qualification_coverage_delete_guard
+  after delete on provider_service_qualifications
+  referencing old table as fr_old_rows
+  for each statement execute function fr_eligibility_delete_guard();
+
 -- TRUNCATE does not fire DELETE triggers, so the guard above is blind to it —
 -- and the development seed truncates through the same DATABASE_URL. A
 -- statement-level BEFORE TRUNCATE trigger closes that, including for tables
