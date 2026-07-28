@@ -157,6 +157,93 @@ concurrent writers therefore serialise and one caller's complete set wins), then
 deletes the old windows *before* flipping the header — the order the composite
 foreign key demands, with no constraint weakened or deferred.
 
+## Physical resources and booking allocation (slice 2A.2b)
+
+Migration `0006` adds the *inventory* and the *claims*. Still no availability
+engine, no endpoint and no UI — and no automatic choice of provider or unit.
+
+- `resource_types` / `branch_resources` — physical units, individually
+  allocatable even when two are interchangeable. `id` is the identity, `code`
+  is the operational identifier (unique among **active** units, so a retired
+  unit's code and label can be reused), `label` is display text.
+- `branch_service_offering_resources` — what an offering needs, attached to the
+  dated per-branch offering exactly like price/duration/buffers in `0004`.
+- `booking_resource_requirement_sets` (+ `booking_resource_requirements`) — the
+  booking's **own sealed snapshot**. Allocation reads this and never the live
+  catalog, so splitting a future offering version cannot retroactively change
+  what an existing booking requires. Three states are distinct and none of them
+  is "zero": no header = a pre-0006 booking (refused, never read as "needs
+  nothing"), unsealed = half built (refused), sealed = authoritative and may
+  legitimately have zero rows.
+- `booking_provider_allocations` / `booking_resource_allocations` — the claims.
+  `bookings.assigned_employee_id` is **gone**: the allocation table is the one
+  source of truth, and the DTO shows the latest historical allocation, so a
+  cancelled booking still names the provider it was assigned to.
+
+What PostgreSQL enforces itself:
+
+- **No double claim** — GiST `EXCLUDE` on `(employee_id, occupancy)` and
+  `(resource_id, occupancy)`, restricted to live rows. Two concurrent requests
+  from two processes are decided by the constraint, never by a check-then-insert.
+- **The claim window cannot be misstated** — `occupancy` is a generated column
+  over mirrored booking columns that a composite FK pins to the booking. Direct
+  SQL gets `42601`/`23503`; rescheduling the booking either moves every claim
+  atomically (`ON UPDATE CASCADE`) or fails with `23P01`. Occupancy is
+  `[starts_at - buffer_before, ends_at + buffer_after)`, so two bookings that
+  merely touch are still a conflict, and it is capped at 24 hours — which is what
+  makes "assignment covers the first and last Muscat date" a complete coverage
+  proof rather than a sample.
+- **Branch and classification** — a unit from another branch is impossible (one
+  shared `branch_id` in two composite FKs), and reclassifying a unit that has
+  allocation history is refused (`ON UPDATE NO ACTION` on a three-column FK).
+  Retire and create a replacement instead.
+- **Provenance** — composite FKs prove the source offering is for the booking's
+  own branch and own service.
+
+What triggers enforce, because a constraint provably cannot: a constraint cannot
+stop a child row being `DELETE`d, and `TRUNCATE` does not fire `DELETE` triggers
+at all. So guards freeze sealed requirement snapshots (including the whole
+primary key, so a row can never be relocated out of a sealed parent), refuse
+`DELETE` on allocations, and **write `released_occupancy` themselves** rather
+than trusting a caller.
+
+**These guards are a guard against accidental destruction, not a security
+boundary.** The role that owns the tables can `ALTER TABLE ... DISABLE TRIGGER`
+or drop them. `TRUNCATE` protection covers **exactly** four tables —
+`booking_provider_allocations`, `booking_resource_allocations`,
+`booking_resource_requirement_sets`, `booking_resource_requirements`.
+`audit_logs`, `bookings`, the catalog tables and every migration-`0005`
+scheduling table are **not** protected and keep their current behaviour. Real
+enforcement needs an application role separate from the migration role, which
+this codebase does not have today.
+
+Repository guarantees (not constraints), each re-proved over the seed by
+anti-join, each with a safe failure direction:
+
+- eligibility — active branch, active employee, dated branch assignment and
+  dated service qualification, read `FOR SHARE` so a concurrent change cannot
+  slip between the check and the write;
+- requirement satisfaction — an exact multiset, which is a set property no row
+  constraint can state;
+- release on a status that stops holding capacity, as one atomic operation with
+  the status change (`applyBookingTransition`; the plain compare-and-swap is not
+  exported, so no caller can flip a status without releasing).
+
+Swaps are **one** operation, not two reassignments: two independent calls each
+release their own side and then collide with the other's committed claim. Every
+allocation operation takes the same global lock order (bookings, then employees,
+then units, each by ascending id) so a swap cannot deadlock, and swaps carry the
+caller's expected allocation sequences **keyed by booking** — a flat list would
+release a third booking's claim and would miss an unlisted live one. Two
+concurrent swaps produce one winner and one `stale` rejection.
+
+Honest limits recorded in code and tests: temporal effectiveness of the source
+offering is proved **at capture time only** — a later reschedule does not
+re-prove it, and slice 2B must revalidate or deliberately keep the original
+capture as provenance. `allocation_seq` is a deterministic *logical* ordering of
+the writes to one booking under its row lock, not wall-clock chronology and not
+an ordering across bookings.
+
 ## Checks
 
 ```bash

@@ -9,15 +9,25 @@
 import bcrypt from 'bcryptjs';
 import {
   addDaysToIsoDate,
+  intersectIntervals,
+  intervalsContain,
+  materializeBranchHours,
+  materializeProviderPresence,
   muscatDateTimeToUtc,
   muscatDayUtcRange,
+  occupancyOf,
   todayInMuscat,
+  type BookingAction,
   type BookingStatus,
+  type UtcInterval,
 } from '@foot-repose/domain';
-import { createPool, withTransaction } from './client';
+import { createPool, withTransaction, type Queryable } from './client';
 import { loadEnv, requireEnv } from './env';
 import { runMigrations } from './migrations';
-import { assertSeedSafety } from './seed-guards';
+import { assertLiveDevelopmentDatabase, assertSeedSafety } from './seed-guards';
+import { allocateBooking, captureBookingRequirements } from './repositories/allocations';
+import { applyBookingTransition } from './repositories/bookings';
+import { loadBranchHours, loadProviderSchedule } from './repositories/scheduling';
 
 export const SEED_PASSWORD = 'FootRepose!Dev1';
 
@@ -73,28 +83,40 @@ const SERVICES = [
 const TOTAL_EMPLOYEES = 160;
 const CUSTOMER_COUNT = 48;
 
-/** Time-coherent status mix for a day of bookings, sorted by start time. */
-function statusForToday(index: number, count: number): BookingStatus {
-  const position = index / count;
-  if (position < 0.25) return 'completed';
-  if (position < 0.4) return 'in_service';
-  if (position < 0.55) return 'checked_in';
-  return 'confirmed';
-}
-
 loadEnv();
 assertSeedSafety({ databaseUrl: requireEnv('DATABASE_URL'), env: process.env });
 
 const pool = createPool(requireEnv('DATABASE_URL'));
 try {
+  // Guard #4, and the first one that asks the DATABASE rather than a string:
+  // it runs BEFORE runMigrations, so a wrong live database receives no DDL, no
+  // DML and no migration row — not merely no TRUNCATE.
+  assertLiveDevelopmentDatabase(
+    (await pool.query<{ db: string }>('SELECT current_database() AS db')).rows[0]!.db,
+    'before migrations',
+  );
+
   await runMigrations(pool);
   const summary = await withTransaction(pool, async (tx) => {
+    // A pool hands out a different connection than the one checked above, so
+    // the destructive transaction re-checks on its own client.
+    assertLiveDevelopmentDatabase(
+      (await tx.query<{ db: string }>('SELECT current_database() AS db')).rows[0]!.db,
+      'inside the destructive transaction',
+    );
+    // Allocation and requirement history refuses TRUNCATE unless a session
+    // explicitly opts in. SET LOCAL — never plain SET, which would survive the
+    // COMMIT and leave the opt-in armed on a pooled connection.
+    await tx.query("SET LOCAL foot_repose.allow_history_wipe = 'on'");
     await tx.query(
-      `TRUNCATE audit_logs, login_rate_limits, sessions, bookings,
+      `TRUNCATE audit_logs, login_rate_limits, sessions,
+                booking_resource_allocations, booking_provider_allocations,
+                booking_resource_requirements, booking_resource_requirement_sets, bookings,
                 branch_hours_override_windows, branch_hours_overrides, branch_weekly_windows,
                 provider_extra_shifts, provider_weekly_windows,
                 provider_service_qualifications, provider_branch_assignments,
-                branch_service_offerings, customers, services,
+                branch_service_offering_resources, branch_service_offerings,
+                branch_resources, resource_types, customers, services,
                 employee_branches, employees, branches RESTART IDENTITY CASCADE`,
     );
 
@@ -356,6 +378,12 @@ try {
       scheduleRows += rows.length;
     };
 
+    // Staff are qualified for exactly these services; bookings may only ever
+    // pick from them. Keeping the set in one place is what stops the old
+    // mismatch (qualify for four, book from six) from coming back.
+    const qualifiedServices = services.slice(0, 4);
+    const qualifiedServiceIds = new Set(qualifiedServices.map((s) => s.id));
+
     const floaterOf = new Map<string, string>(); // staff id -> neighbouring branch
     for (let i = 0; i < 3; i += 1) {
       floaterOf.set(staffByBranch.get(branchIds[i]!)![0]!, branchIds[(i + 1) % branchIds.length]!);
@@ -385,7 +413,7 @@ try {
           rows.push({ branchId: neighbour, kind: 'shift', dow: 5, open: 840, close: 1200 });
         }
         await insertWeeklyWindows(staffId, rows);
-        for (const service of services.slice(0, 4)) {
+        for (const service of qualifiedServices) {
           await tx.query(
             `INSERT INTO provider_service_qualifications (employee_id, service_id, valid_dates)
              VALUES ($1, $2, daterange($3::date, NULL, '[)'))`,
@@ -407,6 +435,75 @@ try {
       scheduleRows += 1;
     }
 
+    // ---- physical resources: FICTIONAL inventory ----
+    // The real branches' chairs and rooms are business data entered later.
+    // Everything here is labelled "Fictional ..." and an invariant proves it.
+    const RESOURCE_TYPES = [
+      { code: 'chair', name: 'Treatment chair' },
+      { code: 'room', name: 'Private room' },
+    ] as const;
+    const typeIds = new Map<string, string>();
+    for (const type of RESOURCE_TYPES) {
+      const row = await tx.query<{ id: string }>(
+        'INSERT INTO resource_types (code, name) VALUES ($1, $2) RETURNING id',
+        [type.code, type.name],
+      );
+      typeIds.set(type.code, row.rows[0]!.id);
+    }
+
+    const CHAIRS_PER_BRANCH = 5;
+    const ROOMS_PER_BRANCH = 2;
+    interface SeededResource { id: string; typeId: string }
+    const resourcesByBranch = new Map<string, SeededResource[]>(branchIds.map((id) => [id, []]));
+    let resourceCount = 0;
+    const insertResource = async (
+      branchId: string,
+      typeCode: 'chair' | 'room',
+      index: number,
+    ): Promise<void> => {
+      const prefix = typeCode === 'chair' ? 'CH' : 'RM';
+      const row = await tx.query<{ id: string }>(
+        `INSERT INTO branch_resources (branch_id, resource_type_id, code, label)
+         VALUES ($1, $2, $3, $4) RETURNING id`,
+        [
+          branchId,
+          typeIds.get(typeCode)!,
+          `${prefix}${String(index).padStart(2, '0')}`,
+          `Fictional ${typeCode === 'chair' ? 'chair' : 'room'} ${index}`,
+        ],
+      );
+      resourcesByBranch.get(branchId)!.push({ id: row.rows[0]!.id, typeId: typeIds.get(typeCode)! });
+      resourceCount += 1;
+    };
+    for (const branchId of branchIds) {
+      for (let i = 1; i <= CHAIRS_PER_BRANCH; i += 1) await insertResource(branchId, 'chair', i);
+      for (let i = 1; i <= ROOMS_PER_BRANCH; i += 1) await insertResource(branchId, 'room', i);
+    }
+
+    // ---- what each offering needs, then CAPTURE it ----
+    // Capturing is what turns "no rows" from "never configured" into the
+    // explicit statement "this offering needs no resources". After capture the
+    // rows are frozen; a change means a new offering version.
+    const ROOM_SERVICE = 'Hot Stone Foot Therapy';
+    const offeringRows = await tx.query<{ id: string; service_name: string }>(
+      `SELECT o.id, s.name AS service_name
+       FROM branch_service_offerings o JOIN services s ON s.id = o.service_id
+       ORDER BY o.id`,
+    );
+    let requirementRows = 0;
+    for (const offering of offeringRows.rows) {
+      const typeCode = offering.service_name === ROOM_SERVICE ? 'room' : 'chair';
+      await tx.query(
+        `INSERT INTO branch_service_offering_resources (offering_id, resource_type_id, required_qty)
+         VALUES ($1, $2, 1)`,
+        [offering.id, typeIds.get(typeCode)!],
+      );
+      requirementRows += 1;
+    }
+    await tx.query(
+      'UPDATE branch_service_offerings SET resource_requirements_captured_at = statement_timestamp()',
+    );
+
     // ---- customers (obviously fictional phone block) ----
     const customerIds: string[] = [];
     for (let i = 0; i < CUSTOMER_COUNT; i += 1) {
@@ -422,70 +519,176 @@ try {
     }
 
     // ---- bookings for yesterday / today / tomorrow (Asia/Muscat) ----
-    let bookingCount = 0;
-    const insertBooking = async (
-      branchId: string,
-      isoDate: string,
-      hour: number,
-      minute: number,
-      status: BookingStatus,
-    ): Promise<void> => {
-      // Bookings may only reference services this branch actually offers;
-      // price/duration/buffers are copied from the branch's effective
-      // offering into the booking's immutable snapshots.
-      const offering = pick(offeringsByBranch.get(branchId)!);
-      const startsAt = muscatDateTimeToUtc(isoDate, hour, minute);
-      const endsAt = new Date(startsAt.getTime() + offering.durationMin * 60_000);
-      const therapists = staffByBranch.get(branchId)!;
-      await tx.query(
-        `INSERT INTO bookings
-           (branch_id, customer_id, service_id, assigned_employee_id, status, starts_at, ends_at,
-            price_baisa, service_name_snapshot, duration_min_snapshot,
-            buffer_before_min_snapshot, buffer_after_min_snapshot)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-        [
-          branchId,
-          pick(customerIds),
-          offering.serviceId,
-          pick(therapists),
-          status,
-          startsAt,
-          endsAt,
-          offering.priceBaisa,
-          offering.serviceName,
-          offering.durationMin,
-          offering.bufferBeforeMin,
-          offering.bufferAfterMin,
-        ],
+    //
+    // Every booking is placed the way the product will have to place one:
+    //
+    //   * the provider is operationally assigned to the branch AND qualified
+    //     for the service (the old seed picked any therapist of the branch and
+    //     any of six services while qualifying staff for only four — so it
+    //     produced bookings served by an unqualified therapist);
+    //   * the FULL derived occupancy — [start - buffer_before, end + buffer_after) —
+    //     sits inside the intersection of the branch's materialised opening
+    //     hours and that provider's materialised presence in that branch. Not
+    //     the service window: prep time before opening is still outside opening
+    //     hours;
+    //   * neither the provider nor any unit is claimed twice. Placement tracks
+    //     what it has already used, and PostgreSQL has the final word anyway.
+    //
+    // Allocation goes through the real repository (`allocateBooking`), so the
+    // seed and the product share one write path — `withUnitOfWork` nests it as
+    // a SAVEPOINT inside this transaction.
+    const GRID_MINUTES = 15;
+    const MINUTE = 60_000;
+    const busy = new Map<string, UtcInterval[]>();
+    const isFree = (key: string, span: UtcInterval): boolean =>
+      !(busy.get(key) ?? []).some(
+        (b) => span.startUtc.getTime() < b.endUtc.getTime() && b.startUtc.getTime() < span.endUtc.getTime(),
       );
-      bookingCount += 1;
+    const markBusy = (key: string, span: UtcInterval): void => {
+      const list = busy.get(key) ?? [];
+      list.push(span);
+      busy.set(key, list);
     };
 
-    const slotTimes = (): { hour: number; minute: number }[] =>
-      Array.from({ length: randInt(8, 10) }, () => ({
-        hour: randInt(10, 20),
-        minute: pick([0, 15, 30, 45] as const),
-      })).sort((a, b) => a.hour * 60 + a.minute - (b.hour * 60 + b.minute));
+    /** Walk the real state machine instead of writing a status straight into
+     * the row: that is what releases the claim for cancelled / no_show. */
+    const STATUS_PATH: Record<Exclude<BookingStatus, 'confirmed'>, BookingAction[]> = {
+      checked_in: ['check_in'],
+      in_service: ['check_in', 'start_service'],
+      completed: ['check_in', 'start_service', 'complete'],
+      cancelled: ['cancel'],
+      no_show: ['mark_no_show'],
+    };
+    const NEXT: Record<BookingAction, BookingStatus> = {
+      check_in: 'checked_in',
+      start_service: 'in_service',
+      complete: 'completed',
+      cancel: 'cancelled',
+      mark_no_show: 'no_show',
+    };
 
-    for (const branchId of branchIds) {
-      // Yesterday: finished days end in terminal states.
-      for (let i = 0; i < randInt(3, 4); i += 1) {
-        await insertBooking(
-          branchId,
-          addDaysToIsoDate(today, -1),
-          randInt(10, 20),
-          pick([0, 30] as const),
-          pick(['completed', 'completed', 'completed', 'no_show', 'cancelled'] as const),
+    let bookingCount = 0;
+    let allocatedCount = 0;
+
+    const placeBooking = async (
+      branchId: string,
+      isoDate: string,
+      status: BookingStatus,
+    ): Promise<boolean> => {
+      const branchHours = materializeBranchHours({
+        isoDate,
+        ...(await loadBranchHours(tx as Queryable, branchId, isoDate)),
+      });
+      if (branchHours.length === 0) return false;
+
+      const offerings = offeringsByBranch.get(branchId)!;
+      for (const staffId of staffByBranch.get(branchId)!) {
+        const schedule = await loadProviderSchedule(tx as Queryable, staffId, isoDate);
+        const presence = materializeProviderPresence({ isoDate, ...schedule }).filter(
+          (p) => p.branchId === branchId,
         );
+        if (presence.length === 0) continue;
+        const bookable = intersectIntervals(branchHours, presence);
+
+        for (const offering of offerings) {
+          if (!qualifiedServiceIds.has(offering.serviceId)) continue;
+          const requiredType =
+            offering.serviceName === ROOM_SERVICE ? typeIds.get('room')! : typeIds.get('chair')!;
+          const unit = resourcesByBranch
+            .get(branchId)!
+            .find((r) => r.typeId === requiredType);
+          if (!unit) continue;
+
+          for (const window of bookable) {
+            for (
+              let start = window.startUtc.getTime();
+              start + offering.durationMin * MINUTE <= window.endUtc.getTime();
+              start += GRID_MINUTES * MINUTE
+            ) {
+              const startsAt = new Date(start);
+              const endsAt = new Date(start + offering.durationMin * MINUTE);
+              const occupancy = occupancyOf({
+                startsAt,
+                endsAt,
+                bufferBeforeMin: offering.bufferBeforeMin,
+                bufferAfterMin: offering.bufferAfterMin,
+              });
+              // The BUFFERED window must fit, not just the service window.
+              if (!intervalsContain([window], [occupancy])) continue;
+              const candidates = resourcesByBranch
+                .get(branchId)!
+                .filter((r) => r.typeId === requiredType && isFree(`r:${r.id}`, occupancy));
+              if (!isFree(`p:${staffId}`, occupancy) || candidates.length === 0) continue;
+              const chosen = candidates[0]!;
+
+              const inserted = await tx.query<{ id: string }>(
+                `INSERT INTO bookings
+                   (branch_id, customer_id, service_id, status, starts_at, ends_at,
+                    price_baisa, service_name_snapshot, duration_min_snapshot,
+                    buffer_before_min_snapshot, buffer_after_min_snapshot)
+                 VALUES ($1, $2, $3, 'confirmed', $4, $5, $6, $7, $8, $9, $10)
+                 RETURNING id`,
+                [
+                  branchId,
+                  pick(customerIds),
+                  offering.serviceId,
+                  startsAt,
+                  endsAt,
+                  offering.priceBaisa,
+                  offering.serviceName,
+                  offering.durationMin,
+                  offering.bufferBeforeMin,
+                  offering.bufferAfterMin,
+                ],
+              );
+              const bookingId = inserted.rows[0]!.id;
+              await captureBookingRequirements(tx as Queryable, bookingId);
+              await allocateBooking(tx as Queryable, bookingId, {
+                employeeId: staffId,
+                resourceIds: [chosen.id],
+              });
+              markBusy(`p:${staffId}`, occupancy);
+              markBusy(`r:${chosen.id}`, occupancy);
+              bookingCount += 1;
+              allocatedCount += 1;
+
+              let current: BookingStatus = 'confirmed';
+              for (const action of STATUS_PATH[status as Exclude<BookingStatus, 'confirmed'>] ?? []) {
+                const result = await applyBookingTransition(
+                  tx as Queryable,
+                  bookingId,
+                  current,
+                  NEXT[action],
+                );
+                if (!result.ok) break;
+                current = NEXT[action];
+              }
+              return true;
+            }
+          }
+        }
       }
-      // Today: a live, time-coherent board.
-      const slots = slotTimes();
-      for (const [i, slot] of slots.entries()) {
-        await insertBooking(branchId, today, slot.hour, slot.minute, statusForToday(i, slots.length));
-      }
-      // Tomorrow: everything still confirmed.
-      for (let i = 0; i < randInt(3, 4); i += 1) {
-        await insertBooking(branchId, addDaysToIsoDate(today, 1), randInt(10, 20), pick([0, 30] as const), 'confirmed');
+      return false;
+    };
+
+    const DAY_PLAN: { isoDate: string; statuses: BookingStatus[] }[] = [
+      {
+        isoDate: addDaysToIsoDate(today, -1),
+        statuses: ['completed', 'completed', 'completed', 'no_show', 'cancelled'],
+      },
+      {
+        isoDate: today,
+        statuses: ['completed', 'completed', 'in_service', 'checked_in', 'confirmed', 'confirmed'],
+      },
+      { isoDate: addDaysToIsoDate(today, 1), statuses: ['confirmed', 'confirmed', 'confirmed', 'confirmed'] },
+    ];
+    for (const branchId of branchIds) {
+      for (const day of DAY_PLAN) {
+        for (const status of day.statuses) {
+          // A day with no capacity left simply yields fewer bookings; the seed
+          // never forces one in on top of an existing claim.
+          await placeBooking(branchId, day.isoDate, status);
+        }
       }
     }
 
@@ -498,6 +701,8 @@ try {
           employees: employeeCount,
           customers: customerIds.length,
           bookings: bookingCount,
+          resources: resourceCount,
+          requirementRows,
           scheduleRows,
           seededFor: today,
         }),
@@ -509,7 +714,10 @@ try {
       employees: employeeCount,
       customers: customerIds.length,
       bookings: bookingCount,
+      allocated: allocatedCount,
       offerings: offeringCount,
+      resources: resourceCount,
+      requirementRows,
       scheduleRows,
       today,
     };
@@ -520,6 +728,9 @@ try {
     `  ${summary.branches} branches, ${summary.employees} employees, ${summary.customers} customers, ${summary.bookings} bookings, ${summary.offerings} offerings`,
   );
   console.log(`  ${summary.scheduleRows} scheduling-input rows (branch hours, assignments, shifts)`);
+  console.log(
+    `  ${summary.resources} fictional resource units, ${summary.requirementRows} offering requirement rows, ${summary.allocated} allocated bookings`,
+  );
   console.log('  Sample logins (password for all: FootRepose!Dev1):');
   console.log('    super admin -> hq.admin@footrepose.example');
   console.log('    manager     -> manager.khw@footrepose.example');

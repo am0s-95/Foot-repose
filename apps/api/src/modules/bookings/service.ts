@@ -12,11 +12,11 @@ import {
   type BookingAction,
 } from '@foot-repose/domain';
 import {
+  applyBookingTransition,
   findBookingById,
   insertAuditLog,
   listBookingsForBranchRange,
   lockBranchIsActive,
-  transitionBookingStatus,
   withTransaction,
   type BookingRecord,
   type BranchRecord,
@@ -120,8 +120,11 @@ export async function transitionBooking(
       );
     }
 
-    const swapped = await transitionBookingStatus(tx, booking.id, booking.status, to);
-    if (!swapped) {
+    // Status change and capacity release are one repository operation, and the
+    // record it returns is re-read AFTER the release — never the snapshot taken
+    // before it.
+    const transition = await applyBookingTransition(tx, booking.id, booking.status, to);
+    if (!transition.ok || transition.booking === null) {
       throw new HttpError(
         409,
         'conflict',
@@ -141,7 +144,7 @@ export async function transitionBooking(
       ip,
     });
 
-    return { ...booking, status: to };
+    return transition.booking;
   });
   return toDto(updated, actor);
 }

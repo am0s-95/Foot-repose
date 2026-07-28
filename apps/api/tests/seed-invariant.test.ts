@@ -1,6 +1,14 @@
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import {
+  intersectIntervals,
+  intervalsContain,
+  materializeBranchHours,
+  materializeProviderPresence,
+  occupancyOf,
+} from '@foot-repose/domain';
+import { loadBranchHours, loadProviderSchedule } from '@foot-repose/db';
 import { closePool, getPool } from '../src/lib/pool';
 
 const DB_PACKAGE_DIR = fileURLToPath(new URL('../../../packages/db', import.meta.url));
@@ -161,6 +169,56 @@ describe('seed invariants', () => {
         SELECT note FROM branch_hours_overrides
         UNION ALL SELECT note FROM provider_extra_shifts) t
       WHERE note IS NULL OR note NOT LIKE 'fictional %'`,
+    // ... and so must the seeded physical inventory.
+    unmarkedFictionalResources: `
+      SELECT count(*)::int AS n FROM branch_resources
+      WHERE label NOT LIKE 'Fictional %'`,
+    // A booking that no longer holds capacity may not keep a live claim. The
+    // link is a repository guarantee (applyBookingTransition), so it is
+    // re-proved here over the whole dataset.
+    liveClaimsOnNonHoldingBookings: `
+      SELECT count(*)::int AS n FROM (
+        SELECT a.booking_id FROM booking_provider_allocations a
+         JOIN bookings b ON b.id = a.booking_id
+         WHERE a.released_at IS NULL AND b.status IN ('cancelled', 'no_show')
+        UNION
+        SELECT r.booking_id FROM booking_resource_allocations r
+         JOIN bookings b ON b.id = r.booking_id
+         WHERE r.released_at IS NULL AND b.status IN ('cancelled', 'no_show')) t`,
+    // Eligibility is a repository guarantee too: assignment AND qualification
+    // must cover every Muscat date the claim's occupancy touches.
+    claimsViolatingEligibility: `
+      SELECT count(*)::int AS n
+      FROM booking_provider_allocations a
+      JOIN bookings b ON b.id = a.booking_id
+      CROSS JOIN LATERAL (
+        SELECT (lower(a.occupancy) AT TIME ZONE 'Asia/Muscat')::date AS d
+        UNION
+        SELECT ((upper(a.occupancy) - interval '1 microsecond') AT TIME ZONE 'Asia/Muscat')::date
+      ) dates
+      WHERE a.released_at IS NULL
+        AND (NOT EXISTS (SELECT 1 FROM provider_branch_assignments pa
+                         WHERE pa.employee_id = a.employee_id AND pa.branch_id = a.branch_id
+                           AND pa.valid_dates @> dates.d)
+         OR NOT EXISTS (SELECT 1 FROM provider_service_qualifications q
+                         WHERE q.employee_id = a.employee_id AND q.service_id = b.service_id
+                           AND q.valid_dates @> dates.d))`,
+    // Every booking with a SEALED snapshot must have exactly the units it
+    // requires. Bookings without a snapshot are pre-0006 history and are
+    // deliberately out of scope — never read as "needs nothing".
+    unsatisfiedRequirements: `
+      SELECT count(*)::int AS n FROM (
+        SELECT s.booking_id, r.resource_type_id, r.required_qty,
+               count(a.id) FILTER (WHERE a.released_at IS NULL) AS held
+        FROM booking_resource_requirement_sets s
+        JOIN booking_resource_requirements r ON r.booking_id = s.booking_id
+        JOIN bookings b ON b.id = s.booking_id
+        LEFT JOIN booking_resource_allocations a
+          ON a.booking_id = s.booking_id AND a.resource_type_id = r.resource_type_id
+        WHERE s.sealed_at IS NOT NULL
+          AND b.status IN ('confirmed', 'checked_in', 'in_service', 'completed')
+        GROUP BY 1, 2, 3
+        HAVING count(a.id) FILTER (WHERE a.released_at IS NULL) <> r.required_qty) t`,
   } as const;
 
   const violations = async (sql: string): Promise<number> =>
@@ -269,6 +327,37 @@ describe('seed invariants', () => {
         (employee_id, branch_id, during, note)
         VALUES ('${staff}', '${home}',
                 tstzrange('2035-05-01T06:00:00Z', '2035-05-01T08:00:00Z', '[)'), 'unmarked')`,
+      // A resource unit whose label does not announce that it is invented.
+      unmarkedFictionalResources: `UPDATE branch_resources SET label = 'Chair 3'
+        WHERE id = (SELECT id FROM branch_resources ORDER BY id LIMIT 1)`,
+      // Cancel a booking behind the repository's back, leaving its claim live.
+      liveClaimsOnNonHoldingBookings: `UPDATE bookings SET status = 'cancelled'
+        WHERE id = (SELECT booking_id FROM booking_provider_allocations
+                     WHERE released_at IS NULL ORDER BY booking_id LIMIT 1)`,
+      // One claim by a provider nobody ever assigned or qualified.
+      claimsViolatingEligibility: `INSERT INTO employees (email, password_hash, full_name, role)
+        VALUES ('probe.unassigned@test.example', 'x', 'Probe Unassigned', 'staff');
+        INSERT INTO bookings (branch_id, customer_id, service_id, status, starts_at, ends_at,
+          price_baisa, service_name_snapshot, duration_min_snapshot,
+          buffer_before_min_snapshot, buffer_after_min_snapshot)
+        SELECT b.branch_id, b.customer_id, b.service_id, 'confirmed',
+               '2036-01-01T06:00:00Z'::timestamptz, '2036-01-01T07:00:00Z'::timestamptz,
+               b.price_baisa, b.service_name_snapshot, b.duration_min_snapshot, 0, 0
+        FROM bookings b ORDER BY b.id LIMIT 1;
+        INSERT INTO booking_provider_allocations
+          (booking_id, branch_id, employee_id, b_starts_at, b_ends_at, b_buf_before, b_buf_after)
+        SELECT bk.id, bk.branch_id, e.id, bk.starts_at, bk.ends_at,
+               bk.buffer_before_min_snapshot, bk.buffer_after_min_snapshot
+        FROM bookings bk, employees e
+        WHERE bk.starts_at = '2036-01-01T06:00:00Z'::timestamptz
+          AND e.email = 'probe.unassigned@test.example'`,
+      // Release one unit of a booking that still requires it.
+      unsatisfiedRequirements: `UPDATE booking_resource_allocations
+        SET released_at = now(), release_reason = 'probe'
+        WHERE id = (SELECT a.id FROM booking_resource_allocations a
+                    JOIN bookings b ON b.id = a.booking_id
+                    WHERE a.released_at IS NULL AND b.status = 'confirmed'
+                    ORDER BY a.id LIMIT 1)`,
     };
 
     for (const [name, fixture] of Object.entries(brokenFixtures) as [
@@ -290,6 +379,71 @@ describe('seed invariants', () => {
     }
     // The rollbacks put everything back: the invariants hold again.
     for (const sql of Object.values(INVARIANTS)) expect(await violations(sql)).toBe(0);
+  });
+
+  it('[R8a] seeds every booking with its FULL occupancy inside real availability', async () => {
+    // Not the service window: the buffered occupancy. A booking starting the
+    // minute the branch opens, with prep time before it, would be off-shift.
+    const pool = getPool();
+    const bookings = await pool.query<{
+      id: string;
+      branch_id: string;
+      employee_id: string;
+      starts_at: Date;
+      ends_at: Date;
+      buffer_before_min_snapshot: number;
+      buffer_after_min_snapshot: number;
+      muscat_date: string;
+    }>(
+      `SELECT b.id, b.branch_id, a.employee_id, b.starts_at, b.ends_at,
+              b.buffer_before_min_snapshot, b.buffer_after_min_snapshot,
+              (lower(a.occupancy) AT TIME ZONE 'Asia/Muscat')::date::text AS muscat_date
+       FROM bookings b
+       JOIN booking_provider_allocations a ON a.booking_id = b.id
+       ORDER BY b.starts_at, b.id`,
+    );
+    expect(bookings.rows.length).toBeGreaterThan(100);
+
+    const offShift: string[] = [];
+    for (const row of bookings.rows) {
+      const date = row.muscat_date;
+      const hours = materializeBranchHours({
+        isoDate: date,
+        ...(await loadBranchHours(pool, row.branch_id, date)),
+      });
+      const presence = materializeProviderPresence({
+        isoDate: date,
+        ...(await loadProviderSchedule(pool, row.employee_id, date)),
+      }).filter((p) => p.branchId === row.branch_id);
+      const bookable = intersectIntervals(hours, presence);
+      const occupancy = occupancyOf({
+        startsAt: row.starts_at,
+        endsAt: row.ends_at,
+        bufferBeforeMin: row.buffer_before_min_snapshot,
+        bufferAfterMin: row.buffer_after_min_snapshot,
+      });
+      if (!intervalsContain(bookable, [occupancy])) offShift.push(row.id);
+    }
+    expect(`off-shift bookings: ${offShift.slice(0, 5).join(', ')}`).toBe('off-shift bookings: ');
+  }, 120_000);
+
+  it('[R8b] never assigns a service to a provider who is not qualified for it', async () => {
+    // The old generator qualified staff for four services and booked from six.
+    const rows = await getPool().query<{ n: number; qualified_services: number }>(
+      `SELECT (SELECT count(*)::int FROM booking_provider_allocations a
+                 JOIN bookings b ON b.id = a.booking_id
+                WHERE NOT EXISTS (SELECT 1 FROM provider_service_qualifications q
+                                  WHERE q.employee_id = a.employee_id
+                                    AND q.service_id = b.service_id)) AS n,
+              (SELECT count(DISTINCT service_id)::int
+                 FROM provider_service_qualifications) AS qualified_services`,
+    );
+    expect(rows.rows[0]!.n).toBe(0);
+    // And the fixture really is narrower than the catalog, so this is not vacuous.
+    const services = await getPool().query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM services',
+    );
+    expect(rows.rows[0]!.qualified_services).toBeLessThan(services.rows[0]!.n);
   });
 
   it('every booking snapshot equals its effective offering (price, duration, buffers)', async () => {
