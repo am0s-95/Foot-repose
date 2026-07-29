@@ -540,6 +540,43 @@ describe('what PostgreSQL refuses', () => {
       expect(await claimContradictions(getPool())).toEqual(NO_CONTRADICTIONS);
     });
 
+    it('accepts BOTH orders inside one transaction: release-then-status as well as status-then-release', async () => {
+      // `applyBookingTransition` uses status-then-release (proved above). The
+      // deferred guard must not quietly forbid the opposite order, which is the
+      // one an operator writing SQL by hand would reach for.
+      const booking = await allocated();
+      const client = await getPool().connect();
+      let outcome = 'no error';
+      try {
+        await client.query('BEGIN');
+        await client.query(
+          `UPDATE booking_provider_allocations SET released_at = now(), release_reason = 'test'
+           WHERE booking_id = $1 AND released_at IS NULL`,
+          [booking],
+        );
+        await client.query(
+          `UPDATE booking_resource_allocations SET released_at = now(), release_reason = 'test'
+           WHERE booking_id = $1 AND released_at IS NULL`,
+          [booking],
+        );
+        await client.query("UPDATE bookings SET status = 'no_show' WHERE id = $1", [booking]);
+        await client.query('COMMIT');
+      } catch (error) {
+        outcome = (error as { code?: string }).code ?? 'unknown';
+        await client.query('ROLLBACK').catch(() => undefined);
+      } finally {
+        client.release();
+      }
+      expect(outcome).toBe('no error');
+      const row = await getPool().query<{ status: string }>(
+        'SELECT status FROM bookings WHERE id = $1',
+        [booking],
+      );
+      expect(row.rows[0]!.status).toBe('no_show');
+      expect(await liveProvider(booking)).toBeNull();
+      expect(await claimContradictions(getPool())).toEqual(NO_CONTRADICTIONS);
+    });
+
     it('refuses to attach a live claim to a booking that already stopped holding', async () => {
       const cancelled = await book({ hour: 20, status: 'cancelled' });
       expect(

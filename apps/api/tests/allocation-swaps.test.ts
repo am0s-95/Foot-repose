@@ -523,6 +523,7 @@ describe('two concurrent calls to the swap itself', () => {
       // Captured BEFORE anything blocks: asking a busy connection for its pid
       // queues behind the statement we are waiting on.
       const secondPid = await backendPid(second);
+      const firstPid = await backendPid(first);
       const [a, b] =
         order === 'reschedule-first'
           ? (['reschedule', 'eligibility'] as const)
@@ -531,7 +532,10 @@ describe('two concurrent calls to the swap itself', () => {
       outcomes.push(await run(first, a));
       await second.query('BEGIN');
       const pending = run(second, b);
-      await waitUntilBlockedBy(pool, secondPid, 3_000);
+      // The RETURN VALUE is the barrier. An empty array after the timeout means
+      // the two never contended, which would make everything below a
+      // coincidence of commit timing rather than a proof.
+      expect(await waitUntilBlockedBy(pool, secondPid, 10_000)).toContain(firstPid);
       const firstOk = outcomes[0] === 'applied';
       await first.query(firstOk ? 'COMMIT' : 'ROLLBACK');
       const secondOutcome = await pending;
@@ -642,14 +646,17 @@ describe('two concurrent calls to the swap itself', () => {
     const outcomes: string[] = [];
     try {
       const secondPid = await backendPid(second);
+      const firstPid = await backendPid(first);
       const [a, b] =
         order === 'claim-first' ? (['claim', 'service'] as const) : (['service', 'claim'] as const);
       await first.query('BEGIN');
       outcomes.push(await run(first, a));
       await second.query('BEGIN');
       const pending = run(second, b);
-      // Deterministic barrier — never a sleep.
-      await waitUntilBlockedBy(pool, secondPid, 5_000);
+      // Deterministic barrier — never a sleep, and the blocker is ASSERTED:
+      // `waitUntilBlockedBy` returns [] on timeout, so ignoring its result
+      // would silently downgrade this to a race that merely happened to work.
+      expect(await waitUntilBlockedBy(pool, secondPid, 10_000)).toContain(firstPid);
       await first.query(outcomes[0] === 'applied' ? 'COMMIT' : 'ROLLBACK');
       const secondOutcome = await pending;
       outcomes.push(secondOutcome);
@@ -716,6 +723,151 @@ describe('two concurrent calls to the swap itself', () => {
     expect(result.contradictions).toEqual(NO_CONTRADICTIONS);
     expect(result.deadlocks).toBe(0);
   }, 30_000);
+
+  /**
+   * [C2-status] Status against claim creation.
+   *
+   * The lock modes are the whole point here. `status` belongs to no unique key,
+   * so an UPDATE touching only it is a NO KEY update — and PostgreSQL defines
+   * FOR NO KEY UPDATE and FOR KEY SHARE as COMPATIBLE. Before the fix these
+   * eight branches never blocked at all (`pg_blocking_pids` empty in every one)
+   * and four of them committed a cancelled booking still holding a live claim.
+   * The deferred final-state guard could not save them: it runs at COMMIT and
+   * cannot see another transaction's uncommitted claim.
+   *
+   * So the barrier assertion below is not ceremony. If the two stopped
+   * conflicting again, every other expectation here would still pass by luck of
+   * commit ordering, and only `toContain(firstPid)` would fail.
+   */
+  async function statusVersusClaim(
+    order: 'status-first' | 'claim-first',
+    kind: 'provider' | 'resource',
+    status: 'cancelled' | 'no_show',
+  ): Promise<{
+    outcomes: string[];
+    commits: string[];
+    blockedByFirst: boolean;
+    deadlocks: number;
+    contradictions: ClaimContradictions;
+    finalStatus: string;
+    liveClaims: number;
+  }> {
+    const pool = getPool();
+    const booking = await makeBooking({
+      branchId: fx.branchA,
+      isoDate: DATE,
+      hour: 8,
+      serviceId: fx.service,
+      customerId: fx.customerOne,
+    });
+
+    const first = await pool.connect();
+    const second = await pool.connect();
+    const run = (client: typeof first, what: 'claim' | 'status'): Promise<string> =>
+      (what === 'status'
+        ? client.query('UPDATE bookings SET status = $2 WHERE id = $1', [booking, status])
+        : kind === 'provider'
+          ? client.query(
+              `INSERT INTO booking_provider_allocations
+                 (booking_id, branch_id, employee_id, b_starts_at, b_ends_at, b_buf_before, b_buf_after)
+               SELECT b.id, b.branch_id, $2, b.starts_at, b.ends_at,
+                      b.buffer_before_min_snapshot, b.buffer_after_min_snapshot
+               FROM bookings b WHERE b.id = $1`,
+              [booking, fx.staffA.id],
+            )
+          : client.query(
+              `INSERT INTO booking_resource_allocations
+                 (booking_id, branch_id, resource_id, resource_type_id,
+                  b_starts_at, b_ends_at, b_buf_before, b_buf_after)
+               SELECT b.id, b.branch_id, $2, $3, b.starts_at, b.ends_at,
+                      b.buffer_before_min_snapshot, b.buffer_after_min_snapshot
+               FROM bookings b WHERE b.id = $1`,
+              [booking, fx.chairA1, fx.chairTypeId],
+            )
+      ).then(
+        () => 'applied',
+        (error: { code?: string }) => error.code ?? 'unknown',
+      );
+    const commit = (client: typeof first): Promise<string> =>
+      client.query('COMMIT').then(
+        () => 'committed',
+        (error: { code?: string }) => error.code ?? 'unknown',
+      );
+
+    const outcomes: string[] = [];
+    const commits: string[] = [];
+    let blockedByFirst = false;
+    try {
+      const secondPid = await backendPid(second);
+      const firstPid = await backendPid(first);
+      const [a, b] =
+        order === 'status-first'
+          ? (['status', 'claim'] as const)
+          : (['claim', 'status'] as const);
+      await first.query('BEGIN');
+      outcomes.push(await run(first, a));
+      await second.query('BEGIN');
+      const pending = run(second, b);
+      blockedByFirst = (await waitUntilBlockedBy(pool, secondPid, 10_000)).includes(firstPid);
+      // Both transactions COMMIT: the deferred guard only speaks at COMMIT, so
+      // rolling either side back early would hide half the mechanism.
+      commits.push(await commit(first));
+      outcomes.push(await pending);
+      commits.push(await commit(second));
+    } finally {
+      first.release();
+      second.release();
+    }
+
+    const row = await pool.query<{ status: string; live: number }>(
+      `SELECT b.status,
+              (SELECT count(*)::int FROM booking_provider_allocations
+                WHERE booking_id = b.id AND released_at IS NULL)
+            + (SELECT count(*)::int FROM booking_resource_allocations
+                WHERE booking_id = b.id AND released_at IS NULL) AS live
+       FROM bookings b WHERE b.id = $1`,
+      [booking],
+    );
+    return {
+      outcomes,
+      commits,
+      blockedByFirst,
+      deadlocks: [...outcomes, ...commits].filter((o) => o === '40P01').length,
+      contradictions: await claimContradictions(pool),
+      finalStatus: row.rows[0]!.status,
+      liveClaims: row.rows[0]!.live,
+    };
+  }
+
+  for (const kind of ['provider', 'resource'] as const) {
+    for (const status of ['cancelled', 'no_show'] as const) {
+      it(`[C2-status] ${status} first, then a ${kind} claim: the claim reads the NEW status and is refused`, async () => {
+        const result = await statusVersusClaim('status-first', kind, status);
+        expect(result.blockedByFirst).toBe(true);
+        expect(result.outcomes[0]).toBe('applied');
+        expect(result.commits[0]).toBe('committed');
+        expect(result.outcomes[1]).toBe('P0001');
+        expect(result.finalStatus).toBe(status);
+        expect(result.liveClaims).toBe(0);
+        expect(result.contradictions).toEqual(NO_CONTRADICTIONS);
+        expect(result.deadlocks).toBe(0);
+      }, 30_000);
+
+      it(`[C2-status] a ${kind} claim first, then ${status}: the status COMMIT is refused`, async () => {
+        const result = await statusVersusClaim('claim-first', kind, status);
+        expect(result.blockedByFirst).toBe(true);
+        expect(result.outcomes[0]).toBe('applied');
+        expect(result.commits[0]).toBe('committed');
+        // The status statement itself only unblocks once the claim commits; the
+        // deferred guard then refuses at ITS commit.
+        expect(result.commits[1]).toBe('P0001');
+        expect(result.finalStatus).toBe('confirmed');
+        expect(result.liveClaims).toBe(1);
+        expect(result.contradictions).toEqual(NO_CONTRADICTIONS);
+        expect(result.deadlocks).toBe(0);
+      }, 30_000);
+    }
+  }
 
   it('[11] two concurrent allocations of the same provider: exactly one succeeds', async () => {
     const pool = getPool();

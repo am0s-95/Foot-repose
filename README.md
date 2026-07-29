@@ -250,12 +250,33 @@ from four different sides, so all four are named here rather than counted:
 
 The **booking row** is the one canonical serialisation point shared by all of
 them, and the documented lock order starts there: bookings by id, then branches,
-then employees by id, then units by id, then the eligibility evidence rows. A
-service change takes the booking row `FOR UPDATE` inside its guard; claim
-creation takes it `FOR KEY SHARE` — the lock the composite foreign key already
-takes — before it reads the service. Neither commit order can therefore validate
-a claim against a service the other is replacing, and both orders are tested
-with `pg_blocking_pids` barriers rather than sleeps.
+then employees by id, then units by id, then the eligibility evidence rows.
+
+Which lock, exactly, is the whole point — "we all touch the booking row" is not
+a serialisation argument:
+
+| Operation | Lock taken on the booking row |
+|---|---|
+| Service change (`fr_booking_determinant_guard`) | `FOR UPDATE` |
+| Status change into `cancelled` / `no_show` (same guard) | `FOR UPDATE` |
+| Provider claim creation / movement (`fr_allocation_eligibility_guard`, `fr_claim_booking_state_guard`) | `FOR KEY SHARE` |
+| Resource claim creation (`fr_claim_booking_state_guard`) | `FOR KEY SHARE` |
+
+`FOR UPDATE` conflicts with `FOR KEY SHARE`, so neither commit order can
+validate a claim against a booking the other is changing out from under it. The
+explicit `FOR UPDATE` on the status path is load-bearing and was **not**
+optional: `status` belongs to no unique key, so an `UPDATE` touching only it is
+a *no-key* update, and PostgreSQL defines `FOR NO KEY UPDATE` and
+`FOR KEY SHARE` as compatible — without the lock the two never blocked at all,
+and a `cancelled` booking could commit while still holding a live claim. The
+deferred final-state check cannot cover that on its own, because it runs at
+`COMMIT` and cannot see another transaction's uncommitted claim.
+
+Every one of these orders is tested with `pg_blocking_pids` barriers rather than
+sleeps, and the barrier's **return value is asserted** to contain the other
+transaction's backend pid — an empty array on timeout means the two never
+contended, which would make every other assertion a coincidence of commit
+timing.
 
 Repository guarantees (not constraints), each re-proved over the seed by
 anti-join, each with a safe failure direction:

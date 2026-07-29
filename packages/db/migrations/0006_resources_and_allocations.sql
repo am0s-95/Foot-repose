@@ -703,8 +703,30 @@ declare
   released_resource integer;
   requirement_sets integer;
 begin
-  -- Semantic distinctness: assigning the same service (or the same NULL-free
-  -- value twice) is a no-op and is never refused.
+  -- STATUS. Taking this lock is not decoration, and FOR KEY SHARE on the claim
+  -- side is not enough on its own to serialise against it. `status` belongs to
+  -- no unique key, so an UPDATE that only changes it is a NO KEY update, and
+  -- PostgreSQL defines FOR NO KEY UPDATE and FOR KEY SHARE as COMPATIBLE. The
+  -- two therefore never blocked, which was demonstrated rather than reasoned
+  -- about: eight runs on 16.13, `pg_blocking_pids` empty in every one, and four
+  -- of the eight committed a cancelled booking holding a live claim.
+  --
+  -- FOR UPDATE conflicts with FOR KEY SHARE, so this makes the booking row a
+  -- genuine serialisation point for BOTH orders:
+  --   * status first — the claim's own guard blocks here, and once this
+  --     transaction commits it reads the NEW non-holding status and refuses;
+  --   * claim first — this UPDATE blocks before its guard body runs, and the
+  --     deferred final-state check below then sees the committed claim and
+  --     refuses.
+  -- Only a transition INTO a non-holding status needs it: nothing about moving
+  -- between holding statuses can strand capacity.
+  if new.status is distinct from old.status
+     and new.status in ('cancelled', 'no_show') then
+    perform 1 from bookings b where b.id = old.id for update;
+  end if;
+
+  -- SERVICE. Semantic distinctness: assigning the same service (or the same
+  -- NULL-free value twice) is a no-op and is never refused.
   if new.service_id is not distinct from old.service_id then
     return new;
   end if;
@@ -744,7 +766,7 @@ create trigger fr_booking_determinant_guard
   before update on bookings
   for each row execute function fr_booking_determinant_guard();
 
--- The same parent-row question for `status`.
+-- The final-state half of the `status` rule.
 --
 -- A status that no longer holds capacity must free it. That link was a
 -- repository guarantee only, so `UPDATE bookings SET status = 'cancelled'`
@@ -752,6 +774,12 @@ create trigger fr_booking_determinant_guard
 -- nobody will attend. DEFERRED on purpose: the controlled path sets the status
 -- and then releases inside ONE transaction, and both orders must be allowed
 -- within it — what must never survive is a COMMIT with the two out of step.
+--
+-- Deferral is also exactly why this check cannot stand alone. It runs at COMMIT
+-- and sees only committed rows, so a claim still open in another transaction is
+-- invisible to it; the FOR UPDATE taken above is what stops that transaction
+-- from existing concurrently in the first place. The lock decides, this
+-- confirms.
 create function fr_booking_status_footprint_guard() returns trigger
   language plpgsql as $fn$
 declare live integer;
@@ -779,6 +807,11 @@ create constraint trigger fr_booking_status_footprint_guard
 -- ...and the same rule seen from the claim side, so a live claim cannot be
 -- attached to a booking that already stopped holding capacity. Both allocation
 -- tables, because a room is held exactly as literally as a provider is.
+--
+-- FOR KEY SHARE here is the lock the composite foreign key already takes, and
+-- it conflicts with the FOR UPDATE the status and service paths take — that
+-- conflict, not the read itself, is what makes this guard's answer current
+-- rather than stale.
 create function fr_claim_booking_state_guard() returns trigger
   language plpgsql as $fn$
 declare booking_status text;
