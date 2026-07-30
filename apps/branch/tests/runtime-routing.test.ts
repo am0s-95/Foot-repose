@@ -79,6 +79,7 @@ function startUpstream(marker: string, port: number): Promise<Upstream> {
       if (path === '/api/cookies') {
         res.writeHead(200, [
           ['content-type', 'application/json'],
+          ['x-upstream', marker],
           ['set-cookie', 'fr_wf_session=abc; Path=/; HttpOnly; SameSite=Lax'],
           ['set-cookie', 'fr_flag=one; Path=/'],
           ['set-cookie', 'fr_stale=; Path=/; Max-Age=0'],
@@ -87,22 +88,30 @@ function startUpstream(marker: string, port: number): Promise<Upstream> {
         return;
       }
       if (path === '/api/empty') {
-        res.writeHead(204);
+        // The marker rides in a HEADER as well as the body, so an assertion
+        // about a body-less response can still say which upstream answered.
+        // Without it, "the 204 came back intact" passed against the pre-fix
+        // build too — which proxied a perfectly intact 204 from the wrong place.
+        res.writeHead(204, { 'x-upstream': marker });
         res.end();
         return;
       }
       if (path === '/api/cacheable') {
-        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'public, max-age=60' });
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          'x-upstream': marker,
+          'cache-control': 'public, max-age=60',
+        });
         res.end(JSON.stringify({ upstream: marker }));
         return;
       }
       if (path.startsWith('/api/status/')) {
         const status = Number(path.slice('/api/status/'.length));
-        res.writeHead(status, { 'content-type': 'application/json' });
+        res.writeHead(status, { 'content-type': 'application/json', 'x-upstream': marker });
         res.end(JSON.stringify({ upstream: marker, status }));
         return;
       }
-      res.writeHead(200, { 'content-type': 'application/json' });
+      res.writeHead(200, { 'content-type': 'application/json', 'x-upstream': marker });
       res.end(
         JSON.stringify({ upstream: marker, method: req.method, url: req.url, body }),
       );
@@ -337,6 +346,7 @@ describe('[F29-C][F29-D][F29-G] what crosses the gateway', () => {
     const response = await fetch(`${gateway.base}/api/empty`);
     expect(response.status).toBe(204);
     expect(await response.text()).toBe('');
+    expect(response.headers.get('x-upstream')).toBe('UPSTREAM-B');
   });
 
   it('[D] passes an upstream Cache-Control through, and defaults to no-store', async () => {
@@ -365,6 +375,7 @@ describe('[F29-C][F29-D][F29-G] what crosses the gateway', () => {
     expect(cookies[0]).toBe('fr_wf_session=abc; Path=/; HttpOnly; SameSite=Lax');
     expect(cookies[1]).toBe('fr_flag=one; Path=/');
     expect(cookies[2]).toBe('fr_stale=; Path=/; Max-Age=0');
+    expect(response.headers.get('x-upstream')).toBe('UPSTREAM-B');
   });
 
   it('[G] never lets a browser-supplied client address reach the API', async () => {
