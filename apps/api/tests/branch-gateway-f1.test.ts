@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../src/lib/pool';
+import { LOGIN_RATE_LIMIT } from '../src/modules/auth/rate-limit';
 import { setupFixtures, TEST_PASSWORD } from './helpers';
 
 /**
@@ -158,6 +159,106 @@ describe('[F29-G] the new gateway does not become a source of client identity', 
     );
     expect(anywhere.rows[0]!.n).toBe(0);
   }, 120_000);
+
+  it('[F29-C] authenticates a follow-up request with the cookie the gateway relayed', async () => {
+    const login = await fetch(`${GATEWAY}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'staff.a@test.example', password: TEST_PASSWORD }),
+    });
+    const raw = login.headers.getSetCookie().find((c) => c.startsWith('fr_wf_session=')) ?? '';
+    // The security attributes the browser will actually store, after two hops.
+    expect(raw).toContain('HttpOnly');
+    expect(raw).toContain('SameSite=Lax');
+
+    const me = await fetch(`${GATEWAY}/api/auth/me`, {
+      headers: { cookie: raw.split(';')[0] ?? '' },
+    });
+    expect(me.status).toBe(200);
+    const profile = (await me.json()) as { employee: { email: string } };
+    expect(profile.employee.email).toBe('staff.a@test.example');
+    expect(me.headers.get('cache-control')).toBe('private, no-store');
+  }, 120_000);
+
+  it('[F29-D] relays real API error statuses, not just successes', async () => {
+    // 401 — wrong password.
+    const unauthorized = await fetch(`${GATEWAY}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'staff.b@test.example', password: 'wrong' }),
+    });
+    expect(unauthorized.status).toBe(401);
+    expect((await unauthorized.json()) as { error: { code: string } }).toMatchObject({
+      error: { code: 'unauthorized' },
+    });
+
+    // 400 — the API's own validation error, reaching the caller unmodified.
+    const invalid = await fetch(`${GATEWAY}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'not-an-email', password: '' }),
+    });
+    expect(invalid.status).toBe(400);
+    expect((await invalid.json()) as { error: { code: string } }).toMatchObject({
+      error: { code: 'validation_error' },
+    });
+
+    // 401 — no session at all, so the unauthenticated shape is the API's too.
+    const anonymous = await fetch(`${GATEWAY}/api/auth/me`);
+    expect(anonymous.status).toBe(401);
+  }, 120_000);
+
+  it('[F1] still throttles one account when the forged address is rotated per attempt', async () => {
+    // This is the exact abuse F1 closed, now driven through the new hop: before
+    // F1 the counter was keyed on email + X-Forwarded-For, so a fresh forged
+    // address bought a fresh allowance every time. The gateway must not hand
+    // that back by forwarding the header.
+    const email = 'manager.a@test.example';
+    const statuses: number[] = [];
+    for (let attempt = 0; attempt < LOGIN_RATE_LIMIT.MAX_ATTEMPTS + 2; attempt += 1) {
+      const response = await fetch(`${GATEWAY}/api/auth/login`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          // A different forged address on every single attempt.
+          'x-forwarded-for': `203.0.113.${attempt + 1}`,
+          'x-real-ip': `198.51.100.${attempt + 1}`,
+        },
+        body: JSON.stringify({ email, password: 'definitely-wrong' }),
+      });
+      statuses.push(response.status);
+    }
+
+    // The allowance is counted per normalized email regardless of the rotation.
+    expect(statuses.filter((status) => status === 429).length).toBeGreaterThan(0);
+    expect(statuses.at(-1)).toBe(429);
+
+    const pool = getPool();
+    // Exactly ONE bucket exists for this account: the mandatory identifier one.
+    //
+    // Stated honestly about what this particular assertion proves: with
+    // TRUSTED_PROXY_HOPS unset, no source bucket would be created even if the
+    // gateway HAD forwarded the header, so this row check alone does not
+    // discriminate. The discriminating evidence is elsewhere — the branch suite
+    // asserts the upstream never receives any of the six headers — and the
+    // check here is the durable statement of the invariant this deployment
+    // must keep holding if that variable is ever set.
+    const keys = await pool.query<{ key: string }>(
+      `SELECT DISTINCT key FROM login_rate_limits
+        WHERE key LIKE '%' || $1 || '%' OR key LIKE 'login:ip:%'
+        ORDER BY key`,
+      [email],
+    );
+    expect(keys.rows.map((row) => row.key)).toEqual([`login:id:${email}`]);
+
+    // And nothing recorded the forged addresses anywhere.
+    const leaked = await pool.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM audit_logs
+        WHERE ip IS NOT NULL OR metadata::text LIKE '%203.0.113.%'
+           OR metadata::text LIKE '%198.51.100.%'`,
+    );
+    expect(leaked.rows[0]!.n).toBe(0);
+  }, 180_000);
 
   it('logs out through the gateway with the cookie deletion intact', async () => {
     const login = await fetch(`${GATEWAY}/api/auth/login`, {
