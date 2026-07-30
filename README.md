@@ -149,7 +149,18 @@ future customer realm):
   `Cookie` and correlation headers; returns the upstream status, body and each
   `Set-Cookie` separately (a merged one would break logout); drops hop-by-hop
   headers, `Host` and stale `Content-Length`; and does not retry, because a
-  repeated POST is a second booking transition. `API_URL` is **required** and
+  repeated POST is a second booking transition. The request body is **streamed**
+  rather than buffered — an unauthenticated caller must not be able to park an
+  arbitrary payload in the branch process before the API, which holds the body
+  limits, sees a byte — so outbound framing is chunked and no `Content-Length` is
+  declared. Every response leaves as `cache-control: private, no-store`: that is
+  a ceiling on the upstream's discretion, not a default, because an upstream
+  `public, max-age=60` would otherwise let a shared cache re-serve one employee's
+  data to another. A response that fails **while its body is being read** —
+  connection reset mid-body, fewer bytes than the declared length, a malformed
+  compressed body — is the same 502 as a refused connection, because `fetch`
+  resolves as soon as the headers arrive and an unguarded read there became an
+  unstructured HTML 500. `API_URL` is **required** and
   must be a bare origin — missing or malformed answers `503`, an unreachable
   upstream `502`, both as the API's structured JSON error with
   `cache-control: private, no-store` and no URL, DNS error or stack in the body.
@@ -162,9 +173,14 @@ future customer realm):
   its silent `http://localhost:3000` fallback remains, deliberately untouched.
 - The branch gateway is a new hop in front of the API, so the **F1** boundary is
   re-proven through it: `x-forwarded-for`, `forwarded`, `x-real-ip`,
-  `cf-connecting-ip`, `true-client-ip` and `x-client-ip` are stripped and none
-  is appended, because this gateway is not trusted infrastructure and must not
-  manufacture the trust `TRUSTED_PROXY_HOPS` exists to gate. A real login
+  `cf-connecting-ip`, `true-client-ip`, `x-client-ip`, `x-forwarded-host`,
+  `x-forwarded-proto`, `x-forwarded-port` and `x-forwarded-prefix` are stripped
+  and none is appended, because this gateway is not trusted infrastructure and
+  must not manufacture the trust `TRUSTED_PROXY_HOPS` exists to gate. The
+  `x-forwarded-host`/`-proto`/`-port` trio matters even though the API reads
+  none of them: Next's own server synthesises them from the caller's `Host`, so
+  they arrive looking authoritative in front of whatever middleware is added
+  next — which is the exact shape of the bug F1 closed. A real login
   through the real gateway to the real API, carrying all six spoofed, still
   leaves `sessions.ip` and `audit_logs.ip` null.
 - State-changing routes enforce an **Origin allowlist** (`ALLOWED_ORIGINS`).
