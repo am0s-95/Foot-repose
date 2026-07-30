@@ -10,4 +10,5 @@ export * from './repositories/employees';
 export * from './repositories/login-rate-limits';
 export * from './repositories/offerings';
 export * from './repositories/scheduling';
+export * from './seed-plan';
 export * from './repositories/sessions';

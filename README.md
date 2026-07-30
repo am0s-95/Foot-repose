@@ -39,6 +39,8 @@ npm install
 cp .env.example .env                      # then edit values
 npm run db:migrate
 SEED_CONFIRM=wipe npm run db:seed         # fictional data; TRUNCATEs everything.
+# Seeds around today by default. Tests pass SEED_REFERENCE_DATE=YYYY-MM-DD so
+# the dataset is a function of a stated day, not of the day they happen to run.
 # Three interlocks: refuses NODE_ENV=production, refuses databases not named
 # *_dev/_development/_local/_test, and refuses to run without SEED_CONFIRM=wipe.
 
@@ -61,6 +63,37 @@ Seed logins (password for all: `FootRepose!Dev1` — dev only):
 
 All seeded people are fictional. Never put real customer or employee data
 in seeds or fixtures.
+
+### What the seed produces, and why it varies
+
+The seed builds three Muscat days around a **reference date** —
+`SEED_REFERENCE_DATE`, defaulting to today. How many bookings fit is a function
+of that date's weekday, and the totals are exact:
+
+| reference weekday | bookings |
+| ----------------- | -------- |
+| Sunday–Wednesday  |      161 |
+| Thursday          |      121 |
+| Friday            |       95 |
+| Saturday          |      106 |
+
+Two deliberate facts explain the whole spread, and `packages/db/src/seed-plan.ts`
+encodes them so a test can derive the number instead of guessing a threshold:
+
+- **Friday is the weekly day off.** Every roster omits it, so no provider is
+  present at their home branch and a Friday reference date seeds **zero**
+  bookings company-wide — not "fewer". A Friday appearing as the reference day,
+  as yesterday, or as tomorrow removes that day's entire contribution.
+- **Al Khuwair is closed tomorrow.** The seed writes a closure override for the
+  first branch on the day after the reference date, so tomorrow contributes ten
+  branches rather than eleven.
+
+This used to be undocumented, and the tests asserted `bookings > 100` and "Al
+Khuwair has something to check in today". Both are true most of the week and
+false on the day off, so the suite went red on a Friday with nothing changed.
+The invariants now assert the derived count, a seven-day matrix exercises every
+weekday on demand, and Playwright's `globalSetup` seeds an explicitly actionable
+reference date and the spec navigates to it through the real next-day button.
 
 ## Vertical slice 1 (this repo state)
 

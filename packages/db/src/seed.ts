@@ -31,6 +31,34 @@ import { loadBranchHours, loadProviderSchedule } from './repositories/scheduling
 
 export const SEED_PASSWORD = 'FootRepose!Dev1';
 
+/**
+ * The Muscat operational date the seed builds its three days around.
+ *
+ * Explicit by design. It used to be `todayInMuscat()` with no way in, which
+ * made every seeded dataset a function of the wall clock — so the same
+ * unchanged code produced 161 bookings on a Wednesday and 95 on a Friday, and
+ * tests that asserted anything about volume passed or failed by calendar.
+ * `SEED_REFERENCE_DATE` lets a test state the day it is testing; a developer
+ * running the seed by hand still gets today, which is what they want.
+ */
+export function seedReferenceDate(env: Record<string, string | undefined> = process.env): string {
+  const raw = env.SEED_REFERENCE_DATE?.trim();
+  if (!raw) return todayInMuscat();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    throw new Error(
+      `SEED_REFERENCE_DATE must be an Asia/Muscat calendar date as YYYY-MM-DD; got ${JSON.stringify(raw)}`,
+    );
+  }
+  // Rejects 2026-02-30 and friends: `Date` would silently roll them forward,
+  // and a seed quietly built around a different day than the one requested is
+  // exactly the class of surprise this variable exists to remove.
+  const parsed = new Date(`${raw}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== raw) {
+    throw new Error(`SEED_REFERENCE_DATE is not a real calendar date: ${JSON.stringify(raw)}`);
+  }
+  return raw;
+}
+
 // Deterministic PRNG so reseeding produces the same dataset (dates aside).
 function mulberry32(seed: number): () => number {
   let a = seed;
@@ -211,7 +239,7 @@ try {
     // ---- versioned offerings: FICTIONAL per-branch variation ----
     // Proves the catalog supports per-branch prices/durations/history; the
     // real company's prices are business data entered later, never invented.
-    const today = todayInMuscat();
+    const today = seedReferenceDate();
     // Validity boundaries sit on Muscat day starts, matching how the API
     // evaluates "effective on date D" (at the start of that Muscat day).
     const currentFrom = muscatDayUtcRange(addDaysToIsoDate(today, -30)).startUtc;
