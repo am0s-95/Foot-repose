@@ -248,25 +248,30 @@ from four different sides, so all four are named here rather than counted:
   bounded sample rather than backfilling a live claim that legacy data cannot
   justify. It invents no eligibility row, releases nothing and rewrites nothing.
 
-The **booking row** is the one canonical serialisation point shared by all of
-them, and the documented lock order starts there: bookings by id, then branches,
-then employees by id, then units by id, then the eligibility evidence rows.
+### Which rows actually serialise which pairs
 
-Which lock, exactly, is the whole point — "we all touch the booking row" is not
-a serialisation argument:
+There is **no single shared lock** across all four surfaces, and claiming one
+would be the easiest way to hide a race. Each contending pair serialises on the
+rows that pair genuinely has in common:
 
-| Operation | Lock taken on the booking row |
-|---|---|
-| Service change (`fr_booking_determinant_guard`) | `FOR UPDATE` |
-| Status change into `cancelled` / `no_show` (same guard) | `FOR UPDATE` |
-| Provider claim creation / movement (`fr_allocation_eligibility_guard`, `fr_claim_booking_state_guard`) | `FOR KEY SHARE` |
-| Resource claim creation (`fr_claim_booking_state_guard`) | `FOR KEY SHARE` |
+| Contending pair | Serialising rows | Locks held |
+|---|---|---|
+| Service or status mutation ↔ claim creation | the **booking** row | `FOR UPDATE` (mutation, in `fr_booking_determinant_guard`) vs `FOR KEY SHARE` (claim guards) |
+| Claim creation / movement ↔ eligibility-evidence `UPDATE`/`DELETE` | the **assignment / qualification** rows | `FOR SHARE` (claim path) vs the mutation's own row locks |
+| Repository allocate / reassign / swap ↔ each other | the **booking** row first, then identities | `FOR UPDATE` on bookings by id, then employees by id, then units by id |
+| Legacy `0005 → 0006` preflight | — | not a concurrent runtime surface: it runs once, inside the migration transaction, before any of these tables carry rows |
 
-`FOR UPDATE` conflicts with `FOR KEY SHARE`, so neither commit order can
-validate a claim against a booking the other is changing out from under it. The
-explicit `FOR UPDATE` on the status path is load-bearing and was **not**
-optional: `status` belongs to no unique key, so an `UPDATE` touching only it is
-a *no-key* update, and PostgreSQL defines `FOR NO KEY UPDATE` and
+The repository path is deliberately **stronger** than the database boundary. Any
+caller going through `allocateBooking` / `reassignProvider` / `swapProviders`
+takes `FOR UPDATE` on the booking row before touching identities or evidence.
+`FOR KEY SHARE` is the *minimum* the in-database guards impose on direct SQL that
+bypasses the repository — enough to conflict with a concurrent service or status
+change, and no more.
+
+`FOR UPDATE` conflicts with `FOR KEY SHARE`, which is what makes the first row of
+that table hold. The explicit `FOR UPDATE` on the status path is load-bearing and
+was **not** optional: `status` belongs to no unique key, so an `UPDATE` touching
+only it is a *no-key* update, and PostgreSQL defines `FOR NO KEY UPDATE` and
 `FOR KEY SHARE` as compatible — without the lock the two never blocked at all,
 and a `cancelled` booking could commit while still holding a live claim. The
 deferred final-state check cannot cover that on its own, because it runs at
@@ -275,8 +280,24 @@ deferred final-state check cannot cover that on its own, because it runs at
 Every one of these orders is tested with `pg_blocking_pids` barriers rather than
 sleeps, and the barrier's **return value is asserted** to contain the other
 transaction's backend pid — an empty array on timeout means the two never
-contended, which would make every other assertion a coincidence of commit
-timing.
+contended.
+
+Transaction outcomes in those tests are read from the **command tag**, never from
+"`COMMIT` did not throw". PostgreSQL treats `COMMIT` on an already-aborted
+transaction as a rollback and returns the `ROLLBACK` tag, so the losing side of a
+race would otherwise be recorded as committed. The harness distinguishes a real
+commit, an explicit rollback, and a `COMMIT` rejected by the deferred guard.
+
+Removing the status lock again was measured in two parts rather than reasoned
+about, because "the other assertions would have passed" is not something an
+early-exiting test can tell you:
+
+- **with the barrier assertion enabled** — all eight races stop there, since it
+  is the first assertion evaluated;
+- **with only that assertion disabled** — the four *status-first* races still
+  fail, on the claim statement succeeding instead of raising `P0001` and on the
+  invalid final state that follows; the four *claim-first* races pass, purely
+  because the claim's `COMMIT` happened to land first.
 
 Repository guarantees (not constraints), each re-proved over the seed by
 anti-join, each with a safe failure direction:

@@ -675,9 +675,13 @@ create trigger fr_provider_allocation_eligibility_guard
 -- requirements from the new offering and re-allocate, and it is not in this
 -- slice. Until it exists, a different service means a different booking.
 --
--- Concurrency. `perform ... for update` on the booking row is THE canonical
--- serialisation point of this slice, and it is the same row `allocateBooking`
--- locks first. Two orders, both proven by execution (not asserted):
+-- Concurrency. `perform ... for update` on the booking row is what serialises
+-- THIS pair — a determinant mutation against claim creation — and it is the same
+-- row `allocateBooking` locks first. It is not a lock shared by every guard in
+-- the slice: claim creation against an eligibility-evidence mutation serialises
+-- on the assignment/qualification rows instead, and the preflight is not a
+-- concurrent surface at all. Two orders, both proven by execution (not
+-- asserted):
 --   * claim created first — the service UPDATE cannot even reach its own guard
 --     body until that transaction ends, then counts the committed claim and
 --     refuses;

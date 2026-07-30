@@ -10,6 +10,7 @@ import {
   allocationErrorOf,
   backendPid,
   claimContradictions,
+  footprintSnapshot,
   makeBooking,
   NO_CONTRADICTIONS,
   setupAllocationFixtures,
@@ -735,22 +736,32 @@ describe('two concurrent calls to the swap itself', () => {
    * The deferred final-state guard could not save them: it runs at COMMIT and
    * cannot see another transaction's uncommitted claim.
    *
-   * So the barrier assertion below is not ceremony. If the two stopped
-   * conflicting again, every other expectation here would still pass by luck of
-   * commit ordering, and only `toContain(firstPid)` would fail.
+   * So the barrier assertion below is not ceremony: it is the FIRST assertion
+   * evaluated, and with the lock removed it is what stops all eight. What the
+   * later assertions would then have done differs by order, and is measured
+   * rather than assumed — see the two-part falsification recorded in the README.
    */
   async function statusVersusClaim(
     order: 'status-first' | 'claim-first',
     kind: 'provider' | 'resource',
     status: 'cancelled' | 'no_show',
   ): Promise<{
-    outcomes: string[];
-    commits: string[];
+    statements: string[];
+    /** How each transaction actually ENDED, never inferred from "COMMIT did not
+     * throw" — see `finish`. */
+    transactions: string[];
     blockedByFirst: boolean;
     deadlocks: number;
     contradictions: ClaimContradictions;
     finalStatus: string;
     liveClaims: number;
+    initialSnapshot: string;
+    winningSnapshot: string;
+    finalSnapshot: string;
+    initialBooking: string;
+    finalBooking: string;
+    providerRows: number;
+    resourceRows: number;
   }> {
     const pool = getPool();
     const booking = await makeBooking({
@@ -788,15 +799,31 @@ describe('two concurrent calls to the swap itself', () => {
         () => 'applied',
         (error: { code?: string }) => error.code ?? 'unknown',
       );
-    const commit = (client: typeof first): Promise<string> =>
-      client.query('COMMIT').then(
-        () => 'committed',
-        (error: { code?: string }) => error.code ?? 'unknown',
-      );
+    /**
+     * How a transaction ENDED, read from the command tag rather than guessed.
+     *
+     * "COMMIT did not throw" is NOT a commit. PostgreSQL treats COMMIT on an
+     * already-aborted transaction as a ROLLBACK and returns the ROLLBACK command
+     * tag, so a helper that only checks for a rejected promise records a
+     * discarded transaction as committed. Verified on 16.13: a clean COMMIT
+     * returns `COMMIT`; COMMIT after a failed statement returns `ROLLBACK`.
+     */
+    const finish = async (client: typeof first, how: 'COMMIT' | 'ROLLBACK'): Promise<string> => {
+      try {
+        const result = await client.query(how);
+        return result.command === 'COMMIT' ? 'committed' : `rolled-back(${result.command})`;
+      } catch (error) {
+        // The deferred guard raising AT commit time. The transaction is gone
+        // either way, but this is a rejection, not a quiet discard.
+        return `commit-rejected(${(error as { code?: string }).code ?? 'unknown'})`;
+      }
+    };
 
-    const outcomes: string[] = [];
-    const commits: string[] = [];
+    const statements: string[] = [];
+    const transactions: string[] = [];
     let blockedByFirst = false;
+    const initialSnapshot = await footprintSnapshot(pool, booking);
+    let winningSnapshot = '';
     try {
       const secondPid = await backendPid(second);
       const firstPid = await backendPid(first);
@@ -805,37 +832,60 @@ describe('two concurrent calls to the swap itself', () => {
           ? (['status', 'claim'] as const)
           : (['claim', 'status'] as const);
       await first.query('BEGIN');
-      outcomes.push(await run(first, a));
+      statements.push(await run(first, a));
       await second.query('BEGIN');
       const pending = run(second, b);
       blockedByFirst = (await waitUntilBlockedBy(pool, secondPid, 10_000)).includes(firstPid);
-      // Both transactions COMMIT: the deferred guard only speaks at COMMIT, so
-      // rolling either side back early would hide half the mechanism.
-      commits.push(await commit(first));
-      outcomes.push(await pending);
-      commits.push(await commit(second));
+      // The first transaction is the winner in both orders: it got there before
+      // the other could even reach its own guard body.
+      transactions.push(await finish(first, 'COMMIT'));
+      // Everything the winner committed, and nothing else, must be the end state.
+      winningSnapshot = await footprintSnapshot(pool, booking);
+      const secondStatement = await pending;
+      statements.push(secondStatement);
+      // A losing statement leaves its transaction ABORTED. Roll it back
+      // explicitly and record the command PostgreSQL actually returns; sending
+      // COMMIT here would be discarded as a ROLLBACK and must not be reported as
+      // a commit. When the statement succeeded, COMMIT is genuine — and for the
+      // status path that is exactly where the deferred guard speaks.
+      transactions.push(
+        await finish(second, secondStatement === 'applied' ? 'COMMIT' : 'ROLLBACK'),
+      );
     } finally {
       first.release();
       second.release();
     }
 
-    const row = await pool.query<{ status: string; live: number }>(
-      `SELECT b.status,
-              (SELECT count(*)::int FROM booking_provider_allocations
-                WHERE booking_id = b.id AND released_at IS NULL)
+    const finalSnapshot = await footprintSnapshot(pool, booking);
+    const parsed = JSON.parse(finalSnapshot) as {
+      booking: { status: string };
+      provider_allocations: unknown[];
+      resource_allocations: unknown[];
+    };
+    const bookingOf = (snapshot: string): string =>
+      JSON.stringify((JSON.parse(snapshot) as { booking: unknown }).booking);
+    const live = await pool.query<{ n: number }>(
+      `SELECT (SELECT count(*)::int FROM booking_provider_allocations
+                WHERE booking_id = $1 AND released_at IS NULL)
             + (SELECT count(*)::int FROM booking_resource_allocations
-                WHERE booking_id = b.id AND released_at IS NULL) AS live
-       FROM bookings b WHERE b.id = $1`,
+                WHERE booking_id = $1 AND released_at IS NULL) AS n`,
       [booking],
     );
     return {
-      outcomes,
-      commits,
+      statements,
+      transactions,
       blockedByFirst,
-      deadlocks: [...outcomes, ...commits].filter((o) => o === '40P01').length,
+      deadlocks: [...statements, ...transactions].filter((o) => o.includes('40P01')).length,
       contradictions: await claimContradictions(pool),
-      finalStatus: row.rows[0]!.status,
-      liveClaims: row.rows[0]!.live,
+      finalStatus: parsed.booking.status,
+      liveClaims: live.rows[0]!.n,
+      initialSnapshot,
+      winningSnapshot,
+      finalSnapshot,
+      initialBooking: bookingOf(initialSnapshot),
+      finalBooking: bookingOf(finalSnapshot),
+      providerRows: parsed.provider_allocations.length,
+      resourceRows: parsed.resource_allocations.length,
     };
   }
 
@@ -844,11 +894,22 @@ describe('two concurrent calls to the swap itself', () => {
       it(`[C2-status] ${status} first, then a ${kind} claim: the claim reads the NEW status and is refused`, async () => {
         const result = await statusVersusClaim('status-first', kind, status);
         expect(result.blockedByFirst).toBe(true);
-        expect(result.outcomes[0]).toBe('applied');
-        expect(result.commits[0]).toBe('committed');
-        expect(result.outcomes[1]).toBe('P0001');
+        expect(result.statements[0]).toBe('applied');
+        expect(result.transactions[0]).toBe('committed');
+        expect(result.statements[1]).toBe('P0001');
+        // The losing transaction is ROLLED BACK, and that is recorded as a
+        // rollback — not as a commit that happened not to throw.
+        expect(result.transactions[1]).toBe('rolled-back(ROLLBACK)');
+        // Only the intended status change survives, byte for byte.
+        expect(result.finalSnapshot).toBe(result.winningSnapshot);
         expect(result.finalStatus).toBe(status);
         expect(result.liveClaims).toBe(0);
+        expect(result.providerRows).toBe(0);
+        expect(result.resourceRows).toBe(0);
+        // ...and the booking differs from its starting state in status ALONE.
+        expect(result.finalBooking).toBe(
+          result.initialBooking.replace('"status":"confirmed"', `"status":"${status}"`),
+        );
         expect(result.contradictions).toEqual(NO_CONTRADICTIONS);
         expect(result.deadlocks).toBe(0);
       }, 30_000);
@@ -856,13 +917,20 @@ describe('two concurrent calls to the swap itself', () => {
       it(`[C2-status] a ${kind} claim first, then ${status}: the status COMMIT is refused`, async () => {
         const result = await statusVersusClaim('claim-first', kind, status);
         expect(result.blockedByFirst).toBe(true);
-        expect(result.outcomes[0]).toBe('applied');
-        expect(result.commits[0]).toBe('committed');
+        expect(result.statements[0]).toBe('applied');
+        expect(result.transactions[0]).toBe('committed');
         // The status statement itself only unblocks once the claim commits; the
-        // deferred guard then refuses at ITS commit.
-        expect(result.commits[1]).toBe('P0001');
+        // deferred guard then refuses at ITS commit — a rejection, not a discard.
+        expect(result.statements[1]).toBe('applied');
+        expect(result.transactions[1]).toBe('commit-rejected(P0001)');
+        // Exactly the winning claim survives, byte for byte...
+        expect(result.finalSnapshot).toBe(result.winningSnapshot);
+        // ...and the booking row is untouched, byte for byte.
+        expect(result.finalBooking).toBe(result.initialBooking);
         expect(result.finalStatus).toBe('confirmed');
         expect(result.liveClaims).toBe(1);
+        expect(result.providerRows).toBe(kind === 'provider' ? 1 : 0);
+        expect(result.resourceRows).toBe(kind === 'resource' ? 1 : 0);
         expect(result.contradictions).toEqual(NO_CONTRADICTIONS);
         expect(result.deadlocks).toBe(0);
       }, 30_000);
