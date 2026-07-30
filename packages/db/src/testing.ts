@@ -4,6 +4,8 @@ import { runMigrations } from './migrations';
 // Test-only surface: migrations stay out of the server bundle (see index.ts),
 // but upgrade-path tests need to drive them directly.
 export { runMigrations } from './migrations';
+export { assertLiveDevelopmentDatabase, isDevelopmentDatabaseName, prepareSeed } from './seed-guards';
+export type { SeedPreparation } from './seed-guards';
 
 /** Exact-suffix rule shared by the live-connection guard and its unit tests:
  * only names ending precisely in `_test` qualify — `foot_repose_test_backup`

@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   breakIsCoveredByShifts,
   intersectIntervals,
+  intervalsContain,
+  muscatDatesOf,
+  occupancyOf,
   materializeBranchHours,
   materializeProviderPresence,
   muscatDayOfWeek,
@@ -468,5 +471,65 @@ describe('break coverage over time AND dates', () => {
       const gapped = shiftAt({ dayOfWeek: 0, openMinute: 130, closeMinute: 300, validFrom: SUN });
       expect(breakIsCoveredByShifts(brk, [night, gapped])).toBe(false);
     });
+  });
+});
+
+describe('occupancy [Slice 2A.2b]', () => {
+  const at = (iso: string): Date => new Date(iso);
+
+  it('is the service window widened by both buffers, half-open', () => {
+    const occupancy = occupancyOf({
+      startsAt: at('2030-01-06T10:00:00Z'),
+      endsAt: at('2030-01-06T11:00:00Z'),
+      bufferBeforeMin: 15,
+      bufferAfterMin: 10,
+    });
+    expect(occupancy.startUtc.toISOString()).toBe('2030-01-06T09:45:00.000Z');
+    expect(occupancy.endUtc.toISOString()).toBe('2030-01-06T11:10:00.000Z');
+  });
+
+  it('is the service window itself when both buffers are zero', () => {
+    const occupancy = occupancyOf({
+      startsAt: at('2030-01-06T10:00:00Z'),
+      endsAt: at('2030-01-06T11:00:00Z'),
+      bufferBeforeMin: 0,
+      bufferAfterMin: 0,
+    });
+    expect(occupancy.startUtc.toISOString()).toBe('2030-01-06T10:00:00.000Z');
+    expect(occupancy.endUtc.toISOString()).toBe('2030-01-06T11:00:00.000Z');
+  });
+
+  it('names one Muscat date inside a day and two consecutive dates across midnight', () => {
+    // 20:00 UTC is 00:00 Muscat the next day.
+    expect(
+      muscatDatesOf({ startUtc: at('2030-01-06T06:00:00Z'), endUtc: at('2030-01-06T08:00:00Z') }),
+    ).toEqual(['2030-01-06']);
+    expect(
+      muscatDatesOf({ startUtc: at('2030-01-06T19:00:00Z'), endUtc: at('2030-01-06T21:00:00Z') }),
+    ).toEqual(['2030-01-06', '2030-01-07']);
+    // Half-open: an interval ending exactly at midnight does not touch the next day.
+    expect(
+      muscatDatesOf({ startUtc: at('2030-01-06T19:00:00Z'), endUtc: at('2030-01-06T20:00:00Z') }),
+    ).toEqual(['2030-01-06']);
+  });
+
+  it('[R4-6a] rejects a booking whose SERVICE window fits but whose buffer falls outside', () => {
+    // The branch opens at 10:00 Muscat (06:00 UTC) and closes at 22:00.
+    const open = [{ startUtc: at('2030-01-06T06:00:00Z'), endUtc: at('2030-01-06T18:00:00Z') }];
+    const spec = {
+      startsAt: at('2030-01-06T06:00:00Z'),
+      endsAt: at('2030-01-06T06:45:00Z'),
+      bufferAfterMin: 10,
+    };
+    // Service window alone: fits exactly at opening time.
+    expect(
+      intervalsContain(open, [{ startUtc: spec.startsAt, endUtc: spec.endsAt }]),
+    ).toBe(true);
+    // Full occupancy with 15 minutes of prep: starts before the branch opens.
+    expect(
+      intervalsContain(open, [occupancyOf({ ...spec, bufferBeforeMin: 15 })]),
+    ).toBe(false);
+    // Without the prep buffer the same booking is containable.
+    expect(intervalsContain(open, [occupancyOf({ ...spec, bufferBeforeMin: 0 })])).toBe(true);
   });
 });

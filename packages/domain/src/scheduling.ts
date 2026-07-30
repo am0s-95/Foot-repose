@@ -354,6 +354,66 @@ export function materializeProviderPresence(input: ProviderScheduleInput): Provi
   );
 }
 
+// ---------------------------------------------------------------- occupancy
+
+/** The columns a booking's occupancy is derived from — all snapshots taken at
+ * booking time, so a later catalog change can never move an existing claim. */
+export interface BookingOccupancyInput {
+  startsAt: Date;
+  endsAt: Date;
+  bufferBeforeMin: number;
+  bufferAfterMin: number;
+}
+
+/**
+ * The window a booking OCCUPIES, which is what may never be claimed twice:
+ * `[starts_at - buffer_before, ends_at + buffer_after)`, half-open.
+ *
+ * This is the same rule migration 0006 applies in the generated `occupancy`
+ * column (via `fr_shift_minutes`), and a test asserts the two agree on a matrix
+ * of cases including midnight crossings and zero buffers. Keeping one rule in
+ * two places is only safe because that test exists.
+ *
+ * The service window alone is NOT the occupancy: prep time occupies the
+ * provider and the resource before the customer arrives, and cleaning time
+ * occupies them after — which is precisely why two bookings that merely touch
+ * are still a conflict.
+ */
+export function occupancyOf(booking: BookingOccupancyInput): UtcInterval {
+  return {
+    startUtc: new Date(booking.startsAt.getTime() - booking.bufferBeforeMin * MINUTE_MS),
+    endUtc: new Date(booking.endsAt.getTime() + booking.bufferAfterMin * MINUTE_MS),
+  };
+}
+
+/**
+ * The Muscat calendar dates an interval touches, first and last.
+ *
+ * The database caps a claim's occupancy at 24 hours, so the dates it touches
+ * are either one day or two CONSECUTIVE days — there is never a third date in
+ * between. That is what makes checking the first and the last date a complete
+ * coverage proof for dated assignments and qualifications rather than a sample
+ * of the range.
+ */
+export function muscatDatesOf(interval: UtcInterval): string[] {
+  const first = muscatDateOfInstant(interval.startUtc);
+  // Half-open: the final instant belongs to the interval, its upper bound does not.
+  const last = muscatDateOfInstant(new Date(interval.endUtc.getTime() - 1));
+  return first === last ? [first] : [first, last];
+}
+
+function muscatDateOfInstant(instant: Date): string {
+  const shifted = new Date(instant.getTime() + 4 * 60 * MINUTE_MS);
+  return shifted.toISOString().slice(0, 10);
+}
+
+/** Is every interval of `inner` fully contained in `outer`? */
+export function intervalsContain(outer: UtcInterval[], inner: UtcInterval[]): boolean {
+  const toSpans = (list: UtcInterval[]): Span[] =>
+    list.map((i) => ({ start: i.startUtc.getTime(), end: i.endUtc.getTime() }));
+  return covers(toSpans(outer), toSpans(inner));
+}
+
 /**
  * Intersection of branch opening hours and provider presence in that branch —
  * the bookable input windows a later slice will place appointments into.

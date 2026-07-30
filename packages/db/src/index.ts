@@ -3,6 +3,7 @@
 // (migrate.ts, seed.ts, testing.ts) and must never enter a server bundle.
 export * from './client';
 export * from './repositories/audit';
+export * from './repositories/allocations';
 export * from './repositories/bookings';
 export * from './repositories/branches';
 export * from './repositories/employees';

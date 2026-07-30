@@ -157,6 +157,179 @@ concurrent writers therefore serialise and one caller's complete set wins), then
 deletes the old windows *before* flipping the header — the order the composite
 foreign key demands, with no constraint weakened or deferred.
 
+## Physical resources and booking allocation (slice 2A.2b)
+
+Migration `0006` adds the *inventory* and the *claims*. Still no availability
+engine, no endpoint and no UI — and no automatic choice of provider or unit.
+
+- `resource_types` / `branch_resources` — physical units, individually
+  allocatable even when two are interchangeable. `id` is the identity, `code`
+  is the operational identifier (unique among **active** units, so a retired
+  unit's code and label can be reused), `label` is display text.
+- `branch_service_offering_resources` — what an offering needs, attached to the
+  dated per-branch offering exactly like price/duration/buffers in `0004`.
+- `booking_resource_requirement_sets` (+ `booking_resource_requirements`) — the
+  booking's **own sealed snapshot**. Allocation reads this and never the live
+  catalog, so splitting a future offering version cannot retroactively change
+  what an existing booking requires. Three states are distinct and none of them
+  is "zero": no header = a pre-0006 booking (refused, never read as "needs
+  nothing"), unsealed = half built (refused), sealed = authoritative and may
+  legitimately have zero rows.
+- `booking_provider_allocations` / `booking_resource_allocations` — the claims.
+  `bookings.assigned_employee_id` is **gone**: the allocation table is the one
+  source of truth, and the DTO shows the latest historical allocation, so a
+  cancelled booking still names the provider it was assigned to.
+
+What PostgreSQL enforces itself:
+
+- **No double claim** — GiST `EXCLUDE` on `(employee_id, occupancy)` and
+  `(resource_id, occupancy)`, restricted to live rows. Two concurrent requests
+  from two processes are decided by the constraint, never by a check-then-insert.
+- **The claim window cannot be misstated** — `occupancy` is a generated column
+  over mirrored booking columns that a composite FK pins to the booking. Direct
+  SQL gets `428C9`/`23503`; rescheduling the booking either moves every claim
+  atomically (`ON UPDATE CASCADE`) or fails with `23P01`. Occupancy is
+  `[starts_at - buffer_before, ends_at + buffer_after)`, so two bookings that
+  merely touch are still a conflict, and it is capped at 24 hours — which is what
+  makes "assignment covers the first and last Muscat date" a complete coverage
+  proof rather than a sample.
+- **Branch and classification** — a unit from another branch is impossible (one
+  shared `branch_id` in two composite FKs), and reclassifying a unit that has
+  allocation history is refused (`ON UPDATE NO ACTION` on a three-column FK).
+  Retire and create a replacement instead.
+- **Provenance** — composite FKs prove the source offering is for the booking's
+  own branch and own service.
+
+What triggers enforce, because a constraint provably cannot: a constraint cannot
+stop a child row being `DELETE`d, and `TRUNCATE` does not fire `DELETE` triggers
+at all. So guards freeze sealed requirement snapshots (including the whole
+primary key, so a row can never be relocated out of a sealed parent), refuse
+`DELETE` on allocations, and **write `released_occupancy` themselves** rather
+than trusting a caller.
+
+**These guards are a guard against accidental destruction, not a security
+boundary.** The role that owns the tables can `ALTER TABLE ... DISABLE TRIGGER`
+or drop them. `TRUNCATE` protection covers **exactly** four tables —
+`booking_provider_allocations`, `booking_resource_allocations`,
+`booking_resource_requirement_sets`, `booking_resource_requirements`.
+`audit_logs`, `bookings`, the catalog tables and every migration-`0005`
+scheduling table are **not** protected and keep their current behaviour. Real
+enforcement needs an application role separate from the migration role, which
+this codebase does not have today.
+
+### Where eligibility is actually enforced
+
+A live claim must be *eligible*, and it must stay eligible. That can be broken
+from four different sides, so all four are named here rather than counted:
+
+- **Claim creation, reassignment and movement.** Allocation reads the covering
+  assignment and qualification rows `FOR SHARE` — the rows it returns *are* the
+  evidence, so a concurrent change cannot slip between the check and the write.
+  A row-level guard then re-judges any live claim — newly inserted, reassigned,
+  or moved by the reschedule cascade — against its **new** window, so a booking
+  moved to a date outside the provider's assignment or qualification is refused.
+- **Mutation of the evidence itself.** A statement-level guard re-examines any
+  `UPDATE`/`DELETE` of `provider_branch_assignments` or
+  `provider_service_qualifications` against the state it produces, and rejects
+  it if a live claim would be left uncovered. Transition tables are used
+  deliberately, so a multi-row statement is judged on the complete
+  post-statement state rather than row by row, and both the old and the new keys
+  are considered.
+- **Mutation of the parent booking's own determinants.** `service_id` is not
+  part of the composite key the claims carry, so changing it cascades nothing
+  and fires no allocation trigger. A booking that carries any scheduling
+  footprint therefore may not change its service at all — and releasing the live
+  claims first is deliberately not enough, because a released claim names no
+  service of its own and would be re-read against the new one. `status` is the
+  same question: a deferred guard refuses to **commit** a booking that stopped
+  holding capacity while it still holds live claims, and the claim side refuses
+  to attach a live claim to such a booking.
+- **The legacy `0005 → 0006` preflight**, which aborts with an exact count and a
+  bounded sample rather than backfilling a live claim that legacy data cannot
+  justify. It invents no eligibility row, releases nothing and rewrites nothing.
+
+### Which rows actually serialise which pairs
+
+There is **no single shared lock** across all four surfaces, and claiming one
+would be the easiest way to hide a race. Each contending pair serialises on the
+rows that pair genuinely has in common:
+
+| Contending pair | Serialising rows | Locks held |
+|---|---|---|
+| Service or status mutation ↔ claim creation | the **booking** row | `FOR UPDATE` (mutation, in `fr_booking_determinant_guard`) vs `FOR KEY SHARE` (claim guards) |
+| Claim creation / movement ↔ eligibility-evidence `UPDATE`/`DELETE` | the **assignment / qualification** rows | `FOR SHARE` (claim path) vs the mutation's own row locks |
+| Repository allocate / reassign / swap ↔ each other | the **booking** row first, then identities | `FOR UPDATE` on bookings by id, then employees by id, then units by id |
+| Legacy `0005 → 0006` preflight | — | not a concurrent runtime surface: it runs once, inside the migration transaction, before any of these tables carry rows |
+
+The repository path is deliberately **stronger** than the database boundary. Any
+caller going through `allocateBooking` / `reassignProvider` / `swapProviders`
+takes `FOR UPDATE` on the booking row before touching identities or evidence.
+`FOR KEY SHARE` is the *minimum* the in-database guards impose on direct SQL that
+bypasses the repository — enough to conflict with a concurrent service or status
+change, and no more.
+
+`FOR UPDATE` conflicts with `FOR KEY SHARE`, which is what makes the first row of
+that table hold. The explicit `FOR UPDATE` on the status path is load-bearing and
+was **not** optional: `status` belongs to no unique key, so an `UPDATE` touching
+only it is a *no-key* update, and PostgreSQL defines `FOR NO KEY UPDATE` and
+`FOR KEY SHARE` as compatible — without the lock the two never blocked at all,
+and a `cancelled` booking could commit while still holding a live claim. The
+deferred final-state check cannot cover that on its own, because it runs at
+`COMMIT` and cannot see another transaction's uncommitted claim.
+
+Every one of these orders is tested with `pg_blocking_pids` barriers rather than
+sleeps, and the barrier's **return value is asserted** to contain the other
+transaction's backend pid — an empty array on timeout means the two never
+contended.
+
+Transaction outcomes in those tests are read from the **command tag**, never from
+"`COMMIT` did not throw". PostgreSQL treats `COMMIT` on an already-aborted
+transaction as a rollback and returns the `ROLLBACK` tag, so the losing side of a
+race would otherwise be recorded as committed. The harness distinguishes a real
+commit, an explicit rollback, and a `COMMIT` rejected by the deferred guard.
+
+Removing the status lock again was measured in two parts rather than reasoned
+about, because "the other assertions would have passed" is not something an
+early-exiting test can tell you:
+
+- **with the barrier assertion enabled** — all eight races stop there, since it
+  is the first assertion evaluated;
+- **with only that assertion disabled** — the four *status-first* races still
+  fail, on the claim statement succeeding instead of raising `P0001` and on the
+  invalid final state that follows; the four *claim-first* races pass, purely
+  because the claim's `COMMIT` happened to land first.
+
+Repository guarantees (not constraints), each re-proved over the seed by
+anti-join, each with a safe failure direction:
+
+- active branch and active employee, checked under lock at allocation time;
+- requirement satisfaction — an exact multiset, which is a set property no row
+  constraint can state;
+- release on a status that stops holding capacity, as one atomic operation with
+  the status change (`applyBookingTransition`; the plain compare-and-swap is not
+  exported, so no caller can flip a status without releasing).
+
+Swaps are **one** operation, not two reassignments: two independent calls each
+release their own side and then collide with the other's committed claim. Every
+allocation operation takes the same global lock order (bookings, then employees,
+then units, each by ascending id) so a swap cannot deadlock, and swaps carry the
+caller's expected allocation sequences **keyed by booking** — a flat list would
+release a third booking's claim and would miss an unlisted live one. Two
+concurrent swaps produce one winner and one `stale` rejection.
+
+Honest limits recorded in code and tests: temporal effectiveness of the source
+offering is proved **at capture time only** — a later reschedule does not
+re-prove it, and slice 2B must revalidate or deliberately keep the original
+capture as provenance. `allocation_seq` is a deterministic *logical* ordering of
+the writes to one booking under its row lock, not wall-clock chronology and not
+an ordering across bookings. A **resource** claim carries no service-specific
+eligibility of its own — what ties units to a service is the sealed requirement
+snapshot, and a booking that has one cannot change service at all. There is no
+service-replacement operation in this slice: changing the service of a booking
+that has ever held a provider or a unit would have to re-snapshot name, duration
+and price, re-capture requirements from the new offering and re-allocate, so
+until that exists a different service means a different booking.
+
 ## Checks
 
 ```bash
