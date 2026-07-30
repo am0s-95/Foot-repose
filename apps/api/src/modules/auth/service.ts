@@ -1,4 +1,3 @@
-import bcrypt from 'bcryptjs';
 import {
   createSession,
   findEmployeeByEmail,
@@ -7,40 +6,67 @@ import {
 } from '@foot-repose/db';
 import { getPool } from '../../lib/pool';
 import { SESSION_TTL_SECONDS } from '../../lib/session';
-import { clearLoginFailures, loginRateLimitKey, registerLoginAttempt } from './rate-limit';
-
-/** Burn comparable time when the email is unknown (no user enumeration). */
-const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', 10);
+import { verifyPassword, VerificationOverloadError } from './password';
+import { clearLoginFailures, registerLoginAttempt } from './rate-limit';
 
 export type LoginOutcome =
   | { status: 'ok'; employeeId: string; sessionId: string }
   | { status: 'invalid' }
-  | { status: 'rate_limited' };
+  | { status: 'rate_limited' }
+  /** Verification capacity is saturated. Answered like throttling on the wire so
+   * it reveals nothing about the account. */
+  | { status: 'overloaded' };
 
 /**
  * Verify credentials with shared rate limiting. Every attempt — success,
- * failure or throttle — is written to the audit log. On success the session
- * row and its audit entry are created in ONE transaction.
+ * failure, throttle or refusal — is written to the audit log. On success the
+ * session row and its audit entry are created in ONE transaction.
+ *
+ * `ip` is the AUTHORITATIVE client address or null; it is never a forwarded
+ * header taken on trust. Rate limiting keys on the normalized email regardless,
+ * so a null address weakens nothing about the mandatory bucket.
  */
-export async function login(email: string, password: string, ip: string | null): Promise<LoginOutcome> {
+export async function login(
+  email: string,
+  password: string,
+  ip: string | null,
+): Promise<LoginOutcome> {
   const pool = getPool();
-  const key = loginRateLimitKey(email, ip);
 
-  const { limited } = await registerLoginAttempt(key);
+  const { limited, dimension } = await registerLoginAttempt(email, ip);
   if (limited) {
     await insertAuditLog(pool, {
       actorEmployeeId: null,
       action: 'auth.login_rate_limited',
       entityType: 'employee',
-      metadata: { email },
+      metadata: { email, dimension },
       ip,
     });
+    // Note the ordering: a throttled attempt returns BEFORE any password
+    // verification, so the cheap control gates the expensive work rather than
+    // the other way round.
     return { status: 'rate_limited' };
   }
 
   const employee = await findEmployeeByEmail(pool, email);
-  // ponytail: compareSync is fine at staff-login volume; switch to async if it ever shows up in latency
-  const passwordOk = bcrypt.compareSync(password, employee?.passwordHash ?? DUMMY_HASH);
+
+  let passwordOk: boolean;
+  try {
+    passwordOk = await verifyPassword(password, employee?.passwordHash ?? null);
+  } catch (error) {
+    if (!(error instanceof VerificationOverloadError)) throw error;
+    // Recorded so operators can tell saturation from throttling; the caller
+    // cannot, because both answer 429 with the same body.
+    await insertAuditLog(pool, {
+      actorEmployeeId: null,
+      action: 'auth.login_verification_rejected',
+      entityType: 'employee',
+      metadata: { email },
+      ip,
+    });
+    return { status: 'overloaded' };
+  }
+
   if (!employee || !passwordOk || !employee.isActive) {
     await insertAuditLog(pool, {
       actorEmployeeId: employee?.id ?? null,
@@ -66,6 +92,6 @@ export async function login(email: string, password: string, ip: string | null):
     });
     return id;
   });
-  await clearLoginFailures(key);
+  await clearLoginFailures(email);
   return { status: 'ok', employeeId: employee.id, sessionId };
 }

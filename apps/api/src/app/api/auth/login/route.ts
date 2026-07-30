@@ -1,11 +1,11 @@
 import { loginRequestSchema } from '@foot-repose/contracts';
 import {
   assertTrustedOrigin,
-  clientIp,
   handle,
   HttpError,
   jsonWithCookie,
   parseJsonBody,
+  trustedClientIp,
 } from '../../../../lib/http';
 import {
   loadAuthContext,
@@ -19,9 +19,12 @@ export async function POST(req: Request): Promise<Response> {
   return handle(async () => {
     assertTrustedOrigin(req);
     const { email, password } = await parseJsonBody(req, loginRequestSchema);
-    const ip = clientIp(req);
+    const ip = trustedClientIp(req);
     const outcome = await login(email, password, ip);
-    if (outcome.status === 'rate_limited') {
+    // Throttling and verification saturation answer IDENTICALLY: same status,
+    // same code, same message. Only the audit log distinguishes them, so the
+    // response cannot be used to probe either the account or the server's load.
+    if (outcome.status === 'rate_limited' || outcome.status === 'overloaded') {
       throw new HttpError(429, 'rate_limited', 'Too many failed attempts — try again later');
     }
     if (outcome.status === 'invalid') {

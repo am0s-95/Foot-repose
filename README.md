@@ -88,9 +88,53 @@ future customer realm):
 - Sessions are **server-revocable**: the JWT cookie references a
   `sessions` row; logout revokes it, so a kept/stolen token dies
   immediately. Cookie: `fr_wf_session`, HttpOnly, SameSite=Lax.
-- Login is **rate limited** per email+ip: fixed 15-minute window stored in
-  PostgreSQL — shared across API instances, survives cold starts, and
-  counts concurrent attempts atomically (audited 429s).
+- Login is **rate limited per normalized email**, in a fixed 15-minute window
+  stored in PostgreSQL — shared across API instances, survives cold starts, and
+  counts concurrent attempts atomically (audited 429s). The identifier is the
+  address `loginRequestSchema` already trimmed and lower-cased, so case and
+  whitespace variants share one counter. It was previously keyed on
+  `email + X-Forwarded-For`, which meant rotating that caller-supplied header
+  handed out a fresh counter per attempt — ten guesses per window became
+  unlimited guesses against one employee.
+- **No client IP is treated as authoritative.** `X-Forwarded-For` is written by
+  whoever sends the request, so `trustedClientIp` returns `null` and neither
+  sessions nor `audit_logs` record a forwarded value as if it were verified.
+  Setting `TRUSTED_PROXY_HOPS=N` opts in once the network genuinely enforces
+  that boundary. The right-most N entries are the **trusted suffix** — each was
+  appended by one of our own hops — and the authoritative address is the
+  **first** of those N (index `length − N`; with N = 1 that is the last entry).
+  **Every** entry of that suffix must be a valid IPv4/IPv6 address, not just the
+  one returned, and the chain is never compacted: dropping an empty element
+  would slide an untrusted value into the trusted slot, so `198.51.100.9,
+  203.0.113.7,` with N = 2 yields `null` rather than the left-hand value. It
+  fails closed when the chain is shorter than declared. Application parsing
+  cannot prove the boundary — only the deployment can, by making the origin
+  unreachable except through those hops. When an authoritative address
+  does exist, a second per-address bucket is counted alongside the mandatory
+  per-email one. Stated plainly: per-email throttling stops an attacker grinding
+  **one** account; it does not stop an attempt spread across many accounts, and
+  without an authoritative source address nothing here does.
+- Password verification runs **off the request thread**, in a small pool of
+  worker threads. `bcrypt.compareSync` blocked the event loop for the whole key
+  expansion, and an unauthenticated caller chooses how often that happens;
+  bcryptjs's promise API is not a fix either, because it chains
+  `process.nextTick` (measured: 1 timer tick per 89 ms, versus 0 for the sync
+  call). Verification is admitted through an explicit gate of 4 with **no
+  queue**; over it the attempt is refused with the same 429 body as throttling,
+  so the response reveals neither the account nor the load. Only `audit_logs`
+  distinguishes the two. The evidence that the loop is free is a deterministic
+  ordering result — a timer armed in the same synchronous block as
+  `verifyPassword` runs *before* it resolves — not a batch timing, because with
+  the gate in place a batch of 8 admits 4 and refuses 4 and so is not the same
+  work as 8 unthrottled verifications.
+- The API builds as a **standalone artifact** (`output: 'standalone'`), and
+  `bcryptjs` is listed in `serverExternalPackages` so the dependency tracer
+  copies it in. Without that it copied **zero** of its files — the worker's
+  `require` lives in a string the bundler cannot see — and a deployed server
+  answered a correct password with `500` and `Cannot find module 'bcryptjs'`
+  while `next start` inside a checkout stayed green. A test builds that
+  artifact, runs it from a directory outside the repository where no ancestor
+  `node_modules` can cover a gap, and logs in for real.
 - State-changing routes enforce an **Origin allowlist** (`ALLOWED_ORIGINS`).
 - Actor-scoped responses ship `cache-control: private, no-store`.
 - `AUTH_SECRET` must be ≥ 32 chars; the `change-me` placeholder is

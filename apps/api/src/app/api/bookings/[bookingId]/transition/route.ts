@@ -2,7 +2,7 @@ import { transitionRequestSchema } from '@foot-repose/contracts';
 import {
   assertTrustedOrigin,
   assertUuid,
-  clientIp,
+  trustedClientIp,
   handle,
   jsonResponse,
   parseJsonBody,
@@ -20,7 +20,7 @@ export async function POST(
     const { bookingId } = await ctx.params;
     assertUuid(bookingId, 'Booking');
     const { action } = await parseJsonBody(req, transitionRequestSchema);
-    const booking = await transitionBooking(auth.actor, bookingId, action, clientIp(req));
+    const booking = await transitionBooking(auth.actor, bookingId, action, trustedClientIp(req));
     return jsonResponse({ booking });
   });
 }
