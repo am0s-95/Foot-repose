@@ -135,6 +135,38 @@ future customer realm):
   while `next start` inside a checkout stayed green. A test builds that
   artifact, runs it from a directory outside the repository where no ancestor
   `node_modules` can cover a gap, and logs in for real.
+- The branch app's API destination is chosen at **run time, per request**, by a
+  gateway route (`apps/branch/src/app/api/[...path]`) rather than by a
+  build-time `rewrites()`. `rewrites()` is evaluated during `next build`, so the
+  destination was written into `.next/routes-manifest.json` and frozen: measured
+  on pre-fix `main`, an artifact built with `API_URL=…:4101` and then started
+  with `API_URL=…:4102` sent every `/api/*` request to 4101 while 4102 received
+  **zero**, with the artifact bytes unchanged — one build could not be promoted
+  between environments, so what shipped was never what was tested. The browser
+  side is unchanged: still relative `/api/*` on the app's own origin, still one
+  HttpOnly SameSite cookie, still no CORS and no `NEXT_PUBLIC_API_URL`. The
+  gateway forwards method, path, raw query (repeated parameters intact), body,
+  `Cookie` and correlation headers; returns the upstream status, body and each
+  `Set-Cookie` separately (a merged one would break logout); drops hop-by-hop
+  headers, `Host` and stale `Content-Length`; and does not retry, because a
+  repeated POST is a second booking transition. `API_URL` is **required** and
+  must be a bare origin — missing or malformed answers `503`, an unreachable
+  upstream `502`, both as the API's structured JSON error with
+  `cache-control: private, no-store` and no URL, DNS error or stack in the body.
+  A hung upstream is **not** addressed: there is no outbound timeout here, so
+  this does not solve F10. The evidence builds the artifact **once with a poison
+  destination**, runs it from outside the repository against two different
+  upstreams, and hashes the tree around the runs. The customer app is a
+  different case, and is tested as such rather than assumed: its `API_URL` read
+  is in a `force-dynamic` Server Component, so it is already a runtime read —
+  its silent `http://localhost:3000` fallback remains, deliberately untouched.
+- The branch gateway is a new hop in front of the API, so the **F1** boundary is
+  re-proven through it: `x-forwarded-for`, `forwarded`, `x-real-ip`,
+  `cf-connecting-ip`, `true-client-ip` and `x-client-ip` are stripped and none
+  is appended, because this gateway is not trusted infrastructure and must not
+  manufacture the trust `TRUSTED_PROXY_HOPS` exists to gate. A real login
+  through the real gateway to the real API, carrying all six spoofed, still
+  leaves `sessions.ip` and `audit_logs.ip` null.
 - State-changing routes enforce an **Origin allowlist** (`ALLOWED_ORIGINS`).
 - Actor-scoped responses ship `cache-control: private, no-store`.
 - `AUTH_SECRET` must be ≥ 32 chars; the `change-me` placeholder is
