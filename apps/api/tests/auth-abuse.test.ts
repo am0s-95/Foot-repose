@@ -200,9 +200,20 @@ describe('[F1c] untrusted forwarding data influences nothing', () => {
       process.env.TRUSTED_PROXY_HOPS = '1';
       expect(trustedClientIp(req('9.9.9.9, 5.6.7.8'))).toBe('5.6.7.8');
       expect(trustedClientIp(req('5.6.7.8'))).toBe('5.6.7.8');
-      // Two trusted hops: one further left.
+      // Two trusted hops: the FIRST entry of the two-element trusted suffix.
       process.env.TRUSTED_PROXY_HOPS = '2';
       expect(trustedClientIp(req('9.9.9.9, 5.6.7.8, 10.0.0.1'))).toBe('5.6.7.8');
+      // The exact reported case: an empty trailing element with N=2 used to
+      // compact down to two entries and return the UNTRUSTED left-hand value.
+      expect(trustedClientIp(req('198.51.100.9, 203.0.113.7,'))).toBeNull();
+      // Every entry of the trusted suffix is validated, not only the one
+      // returned: a malformed NON-candidate hop disqualifies the chain too.
+      expect(trustedClientIp(req('9.9.9.9, 5.6.7.8, not-an-ip'))).toBeNull();
+      expect(trustedClientIp(req('9.9.9.9, 5.6.7.8, 10.0.0.1:443'))).toBeNull();
+      expect(trustedClientIp(req('9.9.9.9, not-an-ip, 10.0.0.1'))).toBeNull();
+      // ...while junk further LEFT is still ignored, as it must be.
+      expect(trustedClientIp(req('<script>, 5.6.7.8, 10.0.0.1'))).toBe('5.6.7.8');
+      expect(trustedClientIp(req(', , 5.6.7.8, 10.0.0.1'))).toBe('5.6.7.8');
       // Fewer entries than declared hops means the request did not traverse the
       // expected boundary: fail closed rather than guess.
       expect(trustedClientIp(req('5.6.7.8'))).toBeNull();
@@ -211,6 +222,12 @@ describe('[F1c] untrusted forwarding data influences nothing', () => {
       expect(trustedClientIp(req('1.2.3.4, not-an-ip'))).toBeNull();
       expect(trustedClientIp(req('1.2.3.4, 999.999.999.999'))).toBeNull();
       expect(trustedClientIp(req('1.2.3.4, 5.6.7.8:1234'))).toBeNull();
+      // An EMPTY trailing element is an element. Compacting the chain would
+      // slide 203.0.113.7 into the trusted slot and hand back an untrusted
+      // value; positions are preserved, so this fails closed instead.
+      expect(trustedClientIp(req('198.51.100.9, 203.0.113.7,'))).toBeNull();
+      expect(trustedClientIp(req('5.6.7.8, '))).toBeNull();
+      expect(trustedClientIp(req(', 5.6.7.8'))).toBe('5.6.7.8');
       // IPv6 is a real address, not a parse failure.
       expect(trustedClientIp(req('1.2.3.4, 2001:db8::1'))).toBe('2001:db8::1');
       // A nonsense contract is refused loudly rather than silently trusting.

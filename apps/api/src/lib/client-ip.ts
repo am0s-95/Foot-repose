@@ -16,10 +16,19 @@ import { isIP } from 'node:net';
  * actually exists:
  *
  *   * unset or 0 (the default) — there is no authoritative client address;
- *   * N >= 1 — the RIGHT-MOST N entries of the chain were appended by
- *     infrastructure under our control, so the authoritative address is the one
- *     immediately to their left: index `length - N`. Everything further left is
- *     whatever the caller sent and is ignored.
+ *   * N >= 1 — the RIGHT-MOST N entries are the TRUSTED SUFFIX: each was
+ *     appended by one of our own hops, recording the peer it actually saw. The
+ *     outermost hop recorded the hop before it, and so on inward, so the FIRST
+ *     entry of that suffix — index `length - N` — is the address the outermost
+ *     trusted hop observed: the client. With N = 1 that is the last entry.
+ *     Everything further left is whatever the caller sent and is ignored.
+ *
+ * Because the position is what carries the meaning, the chain is NOT compacted:
+ * dropping an empty element would slide every later element one place left and
+ * silently promote an untrusted value into the authoritative slot. And every
+ * entry of the trusted suffix is validated, not just the one we return — a
+ * malformed entry there means the chain is not the one this contract describes,
+ * so there is nothing to trust anywhere in it.
  *
  * Setting it is a claim about the network, and the application cannot verify
  * that claim — it can only apply it consistently. What must be true first:
@@ -57,17 +66,21 @@ export function trustedClientIp(req: Request): string | null {
   const hops = trustedProxyHops();
   if (hops === 0) return null;
 
+  const header = req.headers.get('x-forwarded-for');
+  if (header === null) return null;
+
   // `Headers.get` joins repeated headers with ', ', so one split covers both a
-  // single comma-chained header and several separate ones.
-  const chain = (req.headers.get('x-forwarded-for') ?? '')
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter(Boolean);
+  // single comma-chained header and several separate ones. Trimmed but NOT
+  // filtered: positions are the contract, so an empty element stays an element.
+  const chain = header.split(',').map((entry) => entry.trim());
 
   // Fewer entries than trusted hops means the request did not traverse the
   // boundary we were told to expect. Fail closed rather than guess.
   if (chain.length < hops) return null;
-  const candidate = chain[chain.length - hops];
-  if (!candidate || isIP(candidate) === 0) return null;
-  return candidate;
+
+  // The whole trusted suffix must look like something our own hops wrote. One
+  // empty or malformed entry in it disqualifies the chain outright.
+  const suffix = chain.slice(chain.length - hops);
+  if (suffix.some((entry) => isIP(entry) === 0)) return null;
+  return suffix[0] ?? null;
 }

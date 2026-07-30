@@ -1,4 +1,12 @@
 import { Worker } from 'node:worker_threads';
+// Not used on this thread — it is here so the dependency tracer can SEE it.
+// The worker requires bcryptjs from a source string that is opaque to the
+// bundler by design, and an opaque require traces nothing: a standalone build
+// shipped without bcryptjs and login died at runtime while every unit test and
+// `next start` in the checkout stayed green. This import, plus the
+// `serverExternalPackages` entry, is what puts the package in the artifact.
+// The deployment-artifact test is what proves it, and would fail without it.
+import 'bcryptjs';
 import { VERIFY_WORKER_SOURCE } from './verify-worker-source';
 
 /**

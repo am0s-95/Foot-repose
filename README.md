@@ -100,11 +100,16 @@ future customer realm):
   whoever sends the request, so `trustedClientIp` returns `null` and neither
   sessions nor `audit_logs` record a forwarded value as if it were verified.
   Setting `TRUSTED_PROXY_HOPS=N` opts in once the network genuinely enforces
-  that boundary: the authoritative address is then the entry immediately left of
-  the right-most N (which those hops appended), validated as a real IPv4/IPv6
-  address, failing closed when the chain is shorter than declared. Application
-  parsing cannot prove the boundary — only the deployment can, by making the
-  origin unreachable except through those hops. When an authoritative address
+  that boundary. The right-most N entries are the **trusted suffix** — each was
+  appended by one of our own hops — and the authoritative address is the
+  **first** of those N (index `length − N`; with N = 1 that is the last entry).
+  **Every** entry of that suffix must be a valid IPv4/IPv6 address, not just the
+  one returned, and the chain is never compacted: dropping an empty element
+  would slide an untrusted value into the trusted slot, so `198.51.100.9,
+  203.0.113.7,` with N = 2 yields `null` rather than the left-hand value. It
+  fails closed when the chain is shorter than declared. Application parsing
+  cannot prove the boundary — only the deployment can, by making the origin
+  unreachable except through those hops. When an authoritative address
   does exist, a second per-address bucket is counted alongside the mandatory
   per-email one. Stated plainly: per-email throttling stops an attacker grinding
   **one** account; it does not stop an attempt spread across many accounts, and
@@ -117,7 +122,19 @@ future customer realm):
   call). Verification is admitted through an explicit gate of 4 with **no
   queue**; over it the attempt is refused with the same 429 body as throttling,
   so the response reveals neither the account nor the load. Only `audit_logs`
-  distinguishes the two.
+  distinguishes the two. The evidence that the loop is free is a deterministic
+  ordering result — a timer armed in the same synchronous block as
+  `verifyPassword` runs *before* it resolves — not a batch timing, because with
+  the gate in place a batch of 8 admits 4 and refuses 4 and so is not the same
+  work as 8 unthrottled verifications.
+- The API builds as a **standalone artifact** (`output: 'standalone'`), and
+  `bcryptjs` is listed in `serverExternalPackages` so the dependency tracer
+  copies it in. Without that it copied **zero** of its files — the worker's
+  `require` lives in a string the bundler cannot see — and a deployed server
+  answered a correct password with `500` and `Cannot find module 'bcryptjs'`
+  while `next start` inside a checkout stayed green. A test builds that
+  artifact, runs it from a directory outside the repository where no ancestor
+  `node_modules` can cover a gap, and logs in for real.
 - State-changing routes enforce an **Origin allowlist** (`ALLOWED_ORIGINS`).
 - Actor-scoped responses ship `cache-control: private, no-store`.
 - `AUTH_SECRET` must be ≥ 32 chars; the `change-me` placeholder is
