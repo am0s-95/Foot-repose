@@ -88,9 +88,36 @@ future customer realm):
 - Sessions are **server-revocable**: the JWT cookie references a
   `sessions` row; logout revokes it, so a kept/stolen token dies
   immediately. Cookie: `fr_wf_session`, HttpOnly, SameSite=Lax.
-- Login is **rate limited** per email+ip: fixed 15-minute window stored in
-  PostgreSQL — shared across API instances, survives cold starts, and
-  counts concurrent attempts atomically (audited 429s).
+- Login is **rate limited per normalized email**, in a fixed 15-minute window
+  stored in PostgreSQL — shared across API instances, survives cold starts, and
+  counts concurrent attempts atomically (audited 429s). The identifier is the
+  address `loginRequestSchema` already trimmed and lower-cased, so case and
+  whitespace variants share one counter. It was previously keyed on
+  `email + X-Forwarded-For`, which meant rotating that caller-supplied header
+  handed out a fresh counter per attempt — ten guesses per window became
+  unlimited guesses against one employee.
+- **No client IP is treated as authoritative.** `X-Forwarded-For` is written by
+  whoever sends the request, so `trustedClientIp` returns `null` and neither
+  sessions nor `audit_logs` record a forwarded value as if it were verified.
+  Setting `TRUSTED_PROXY_HOPS=N` opts in once the network genuinely enforces
+  that boundary: the authoritative address is then the entry immediately left of
+  the right-most N (which those hops appended), validated as a real IPv4/IPv6
+  address, failing closed when the chain is shorter than declared. Application
+  parsing cannot prove the boundary — only the deployment can, by making the
+  origin unreachable except through those hops. When an authoritative address
+  does exist, a second per-address bucket is counted alongside the mandatory
+  per-email one. Stated plainly: per-email throttling stops an attacker grinding
+  **one** account; it does not stop an attempt spread across many accounts, and
+  without an authoritative source address nothing here does.
+- Password verification runs **off the request thread**, in a small pool of
+  worker threads. `bcrypt.compareSync` blocked the event loop for the whole key
+  expansion, and an unauthenticated caller chooses how often that happens;
+  bcryptjs's promise API is not a fix either, because it chains
+  `process.nextTick` (measured: 1 timer tick per 89 ms, versus 0 for the sync
+  call). Verification is admitted through an explicit gate of 4 with **no
+  queue**; over it the attempt is refused with the same 429 body as throttling,
+  so the response reveals neither the account nor the load. Only `audit_logs`
+  distinguishes the two.
 - State-changing routes enforce an **Origin allowlist** (`ALLOWED_ORIGINS`).
 - Actor-scoped responses ship `cache-control: private, no-store`.
 - `AUTH_SECRET` must be ≥ 32 chars; the `change-me` placeholder is

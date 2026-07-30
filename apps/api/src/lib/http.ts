@@ -111,7 +111,6 @@ export function assertUuid(value: string, entity: string): string {
   return value;
 }
 
-export function clientIp(req: Request): string | null {
-  const forwarded = req.headers.get('x-forwarded-for');
-  return forwarded ? (forwarded.split(',')[0]?.trim() ?? null) : null;
-}
+/** Re-exported so route handlers have one obvious import, and so no caller can
+ * reach for a raw `x-forwarded-for` value by accident. */
+export { trustedClientIp } from './client-ip';

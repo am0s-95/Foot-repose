@@ -5,7 +5,7 @@ import { POST as logoutPost } from '../src/app/api/auth/logout/route';
 import { GET as meGet } from '../src/app/api/auth/me/route';
 import { GET as branchesGet } from '../src/app/api/branches/route';
 import { GET as publicBranchesGet } from '../src/app/api/public/branches/route';
-import { LOGIN_RATE_LIMIT } from '../src/modules/auth/rate-limit';
+import { LOGIN_RATE_LIMIT, loginIdentifierKey } from '../src/modules/auth/rate-limit';
 import { getPool } from '../src/lib/pool';
 import {
   createPool,
@@ -128,7 +128,7 @@ describe('login rate limiting (PostgreSQL-backed)', () => {
       }),
     );
 
-  it('throttles repeated failures per email+ip and audits it', async () => {
+  it('throttles repeated failures per normalized email and audits it', async () => {
     await resetAllLoginAttempts(getPool());
     for (let i = 0; i < LOGIN_RATE_LIMIT.MAX_ATTEMPTS; i += 1) {
       expect((await failedAttempt('hammered@test.example')).status).toBe(401);
@@ -150,7 +150,7 @@ describe('login rate limiting (PostgreSQL-backed)', () => {
     );
     const row = await getPool().query<{ total: string }>(
       'SELECT coalesce(sum(attempts), 0) AS total FROM login_rate_limits WHERE key = $1',
-      [`${email}|unknown`],
+      [loginIdentifierKey(email)],
     );
     expect(Number(row.rows[0]!.total)).toBe(parallelAttempts);
     expect((await failedAttempt(email)).status).toBe(429);
@@ -161,7 +161,7 @@ describe('login rate limiting (PostgreSQL-backed)', () => {
     await resetAllLoginAttempts(getPool());
     const url = process.env.DATABASE_URL;
     if (!url) throw new Error('DATABASE_URL missing');
-    const key = 'instances@test.example|10.0.0.9';
+    const key = loginIdentifierKey('instances@test.example');
     const instanceA = createPool(url);
     try {
       for (let i = 1; i <= 6; i += 1) {

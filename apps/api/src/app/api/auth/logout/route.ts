@@ -1,5 +1,5 @@
 import { insertAuditLog, revokeSession, withTransaction } from '@foot-repose/db';
-import { assertTrustedOrigin, clientIp, handle, jsonWithCookie } from '../../../../lib/http';
+import { assertTrustedOrigin, handle, jsonWithCookie, trustedClientIp } from '../../../../lib/http';
 import { clearedSessionCookie, getAuthContext } from '../../../../lib/session';
 import { getPool } from '../../../../lib/pool';
 
@@ -17,7 +17,7 @@ export async function POST(req: Request): Promise<Response> {
           action: 'auth.logout',
           entityType: 'employee',
           entityId: auth.employee.id,
-          ip: clientIp(req),
+          ip: trustedClientIp(req),
         });
       });
     }
