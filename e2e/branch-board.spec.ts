@@ -49,8 +49,10 @@ test('login → bookings board → check-in → status + audit log', async ({ pa
   // it is the branch the seed closes that day. `global-setup.ts` therefore
   // seeded `actionableReferenceDate(today)`, and this walks to the same date
   // using the same rule and the same next-day button a manager would use.
+  // The label reads '…' until the first board response lands, so wait for a
+  // real date before reading it — otherwise this races a cold API.
+  await expect(page.locator('.date-label')).toHaveText(/^\d{4}-\d{2}-\d{2}$/);
   const boardDate = (await page.locator('.date-label').innerText()).trim();
-  expect(boardDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
   const offset = actionableDayOffset(boardDate);
   for (let step = 0; step < offset; step += 1) {
     await page.getByRole('button', { name: 'Next day' }).click();

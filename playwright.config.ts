@@ -14,6 +14,8 @@ export default defineConfig({
   globalSetup: './e2e/global-setup.ts',
   timeout: 60_000,
   fullyParallel: false,
+  // One worker: the date-matrix spec reseeds the shared database between cases.
+  workers: 1,
   reporter: [['list']],
   use: {
     baseURL: 'http://localhost:3001',

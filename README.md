@@ -88,6 +88,14 @@ encodes them so a test can derive the number instead of guessing a threshold:
   first branch on the day after the reference date, so tomorrow contributes ten
   branches rather than eleven.
 
+**A reference date before yesterday cannot be seeded at all.** Migration 0005
+refuses a branch-hours override for a past Muscat date ("past days are
+history"), and the seed writes one for `reference + 1`. So a live-database audit
+can only cover today − 1 forward, whatever day it runs. Full multi-month
+coverage therefore lives in `packages/db/tests/seed-plan.test.ts`, which is pure
+and exhaustive over 62 consecutive dates; `packages/db/src/seed-audit.ts` runs
+the same assertions against real rows for the seedable sub-range.
+
 This used to be undocumented, and the tests asserted `bookings > 100` and "Al
 Khuwair has something to check in today". Both are true most of the week and
 false on the day off, so the suite went red on a Friday with nothing changed.
