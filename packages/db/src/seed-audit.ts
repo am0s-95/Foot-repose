@@ -34,7 +34,8 @@ import {
 } from '@foot-repose/domain';
 import { createPool, type Queryable } from './client';
 import { loadBranchHours, loadProviderSchedule } from './repositories/scheduling';
-import { loadEnv, requireEnv } from './env';
+import { loadEnv } from './env';
+import { databaseNameOf, resolveAuditDatabaseUrl } from './seed-audit-guard';
 import {
   actionableReferenceDate,
   expectedSeedBookings,
@@ -62,7 +63,6 @@ interface Row {
   expected: number;
   actual: number;
   byStatus: Record<string, number>;
-  branchesWithBookings: number;
   khw: Record<string, number>;
   windowDates: string[];
   outsideWindow: string[];
@@ -83,6 +83,10 @@ interface Row {
     withoutBranchAssignment: number;
     withoutServiceQualification: number;
   };
+  population: AllocationPopulation;
+  /** Real counts per branch code — the report claimed these while the query
+   * only counted DISTINCT branch ids. */
+  byBranch: Record<string, number>;
   problems: string[];
 }
 
@@ -92,6 +96,15 @@ interface EligibilityCounters {
   outsideProviderPresence: number;
   withoutBranchAssignment: number;
   withoutServiceQualification: number;
+}
+
+interface AllocationPopulation {
+  bookings: number;
+  allocationsAudited: number;
+  liveAllocations: number;
+  releasedAllocations: number;
+  bookingsWithoutProviderAllocation: number;
+  bookingsWithMultipleProviderAllocations: number;
 }
 
 /**
@@ -104,7 +117,9 @@ interface EligibilityCounters {
  * all honoured. The comparison is against the FULL buffered occupancy, not the
  * service window: prep time before opening is still outside opening hours.
  */
-async function auditEligibility(db: Queryable): Promise<EligibilityCounters> {
+async function auditEligibility(
+  db: Queryable,
+): Promise<{ eligibility: EligibilityCounters; population: AllocationPopulation }> {
   const counters: EligibilityCounters = {
     outsideBranchAvailability: 0,
     outsideProviderPresence: 0,
@@ -112,7 +127,13 @@ async function auditEligibility(db: Queryable): Promise<EligibilityCounters> {
     withoutServiceQualification: 0,
   };
 
-  const live = await db.query<{
+  // EVERY allocation, released ones included. The filter used to be
+  // `released_at IS NULL`, which silently excluded every cancelled and no-show
+  // booking — the real state machine releases their claims — so a third of the
+  // seeded population was never checked while the report said the population
+  // was covered. A released claim still names a provider, a branch and a time,
+  // and all of those must have been legitimate when it was made.
+  const allocations = await db.query<{
     branch_id: string;
     employee_id: string;
     service_id: string;
@@ -121,15 +142,30 @@ async function auditEligibility(db: Queryable): Promise<EligibilityCounters> {
     buffer_before: number;
     buffer_after: number;
     muscat_date: string;
+    released: boolean;
   }>(
     `SELECT b.branch_id, a.employee_id, b.service_id, b.starts_at, b.ends_at,
             b.buffer_before_min_snapshot AS buffer_before,
             b.buffer_after_min_snapshot  AS buffer_after,
-            (lower(a.occupancy) AT TIME ZONE 'Asia/Muscat')::date::text AS muscat_date
+            (lower(a.occupancy) AT TIME ZONE 'Asia/Muscat')::date::text AS muscat_date,
+            (a.released_at IS NOT NULL) AS released
        FROM booking_provider_allocations a
        JOIN bookings b ON b.id = a.booking_id
-      WHERE a.released_at IS NULL
       ORDER BY b.starts_at`,
+  );
+
+  const shape = await db.query<{
+    bookings: number;
+    without_allocation: number;
+    with_multiple: number;
+  }>(
+    `SELECT (SELECT count(*)::int FROM bookings) AS bookings,
+            (SELECT count(*)::int FROM bookings b
+              WHERE NOT EXISTS (SELECT 1 FROM booking_provider_allocations a
+                                 WHERE a.booking_id = b.id)) AS without_allocation,
+            (SELECT count(*)::int FROM (
+               SELECT booking_id FROM booking_provider_allocations
+                GROUP BY booking_id HAVING count(*) > 1) s) AS with_multiple`,
   );
 
   // Cached per (branch|date) and (employee|date): the seed places many bookings
@@ -137,7 +173,7 @@ async function auditEligibility(db: Queryable): Promise<EligibilityCounters> {
   const branchCache = new Map<string, Awaited<ReturnType<typeof materializeBranchHours>>>();
   const presenceCache = new Map<string, ReturnType<typeof materializeProviderPresence>>();
 
-  for (const row of live.rows) {
+  for (const row of allocations.rows) {
     const occupancy = occupancyOf({
       startsAt: row.starts_at,
       endsAt: row.ends_at,
@@ -194,11 +230,26 @@ async function auditEligibility(db: Queryable): Promise<EligibilityCounters> {
     if (qualification.rows[0]!.n === 0) counters.withoutServiceQualification += 1;
   }
 
-  return counters;
+  return {
+    eligibility: counters,
+    population: {
+      bookings: shape.rows[0]!.bookings,
+      allocationsAudited: allocations.rows.length,
+      liveAllocations: allocations.rows.filter((r) => !r.released).length,
+      releasedAllocations: allocations.rows.filter((r) => r.released).length,
+      bookingsWithoutProviderAllocation: shape.rows[0]!.without_allocation,
+      bookingsWithMultipleProviderAllocations: shape.rows[0]!.with_multiple,
+    },
+  };
 }
 
 loadEnv();
-const databaseUrl = requireEnv('DATABASE_URL');
+// ENFORCED, not documented: refuses a missing URL, and refuses one that is the
+// application or integration-test database. Checked before a single row is
+// wiped, because the failure it prevents already happened once and looked like
+// a determinism bug rather than a configuration mistake.
+const databaseUrl = resolveAuditDatabaseUrl();
+console.log(`Audit database: ${databaseNameOf(databaseUrl)}`);
 const pool = createPool(databaseUrl);
 
 const [, , fromArg, toArg] = process.argv;
@@ -239,7 +290,14 @@ const rows: Row[] = [];
 try {
   for (const date of seedable) {
     execFileSync('npx', ['tsx', SEED_SCRIPT], {
-      env: { ...process.env, SEED_CONFIRM: 'wipe', SEED_REFERENCE_DATE: date },
+      // The child seeds the AUDIT database. Inheriting DATABASE_URL would send
+      // it at the very database the guard above just refused.
+      env: {
+        ...process.env,
+        DATABASE_URL: databaseUrl,
+        SEED_CONFIRM: 'wipe',
+        SEED_REFERENCE_DATE: date,
+      },
       stdio: 'pipe',
       timeout: 180_000,
     });
@@ -259,8 +317,17 @@ try {
         GROUP BY 1 ORDER BY 1`,
       [SEED_CLOSED_TOMORROW_BRANCH_CODE, date],
     );
-    const branchesWithBookings = await pool.query<{ n: number }>(
-      'SELECT count(DISTINCT branch_id)::int AS n FROM bookings',
+    // The actual map, per branch code. The old query counted DISTINCT branch
+    // ids and the report called it "per-branch counts" — a number of branches
+    // is not a distribution, and it could not have detected an imbalance.
+    const perBranchRows = await pool.query<{ code: string; n: number }>(
+      `SELECT b.code, count(*)::int AS n
+         FROM bookings bk JOIN branches b ON b.id = bk.branch_id
+        GROUP BY 1 ORDER BY 1`,
+    );
+    const byBranch = Object.fromEntries(perBranchRows.rows.map((r) => [r.code, r.n]));
+    const knownBranches = await pool.query<{ code: string }>(
+      'SELECT code FROM branches ORDER BY code',
     );
     const selectedActionableDate = actionableReferenceDate(date);
     // Confirmed Al Khuwair bookings on THIS row's own reference date. The field
@@ -285,7 +352,7 @@ try {
     // the API compute availability: materialise the branch's hours and the
     // provider's presence for the occupancy's Muscat date, then ask whether the
     // full buffered occupancy fits inside their intersection.
-    const eligibility = await auditEligibility(pool as unknown as Queryable);
+    const { eligibility, population } = await auditEligibility(pool as unknown as Queryable);
 
     const actualTotal = byDate.rows.reduce((sum, r) => sum + r.n, 0);
     const window = [addDaysToIsoDate(date, -1), date, addDaysToIsoDate(date, 1)];
@@ -308,10 +375,31 @@ try {
     for (const [label, count] of Object.entries(eligibility)) {
       if (count > 0) problems.push(`${count} allocation(s) ${label}`);
     }
+    if (population.bookingsWithoutProviderAllocation > 0) {
+      problems.push(`${population.bookingsWithoutProviderAllocation} booking(s) with no provider allocation`);
+    }
+    if (population.bookingsWithMultipleProviderAllocations > 0) {
+      problems.push(
+        `${population.bookingsWithMultipleProviderAllocations} booking(s) with more than one provider allocation`,
+      );
+    }
+    if (population.allocationsAudited !== actualTotal) {
+      problems.push(`audited ${population.allocationsAudited} allocation(s) for ${actualTotal} booking(s)`);
+    }
     if (isMuscatDayOff(selectedActionableDate)) {
       problems.push(`selected actionable date ${selectedActionableDate} is the day off`);
     }
-    if (branchesWithBookings.rows[0]!.n > SEED_BRANCH_COUNT) problems.push('more branches than exist');
+    const known = new Set(knownBranches.rows.map((r) => r.code));
+    for (const code of Object.keys(byBranch)) {
+      if (!known.has(code)) problems.push(`unknown branch code ${code}`);
+    }
+    if (known.size !== SEED_BRANCH_COUNT) {
+      problems.push(`${known.size} branches exist, expected ${SEED_BRANCH_COUNT}`);
+    }
+    const branchSum = Object.values(byBranch).reduce((a, b) => a + b, 0);
+    if (branchSum !== actualTotal) {
+      problems.push(`byBranch sums to ${branchSum}, not ${actualTotal}`);
+    }
 
     rows.push({
       date,
@@ -319,7 +407,6 @@ try {
       expected: expected.total,
       actual: actualTotal,
       byStatus: Object.fromEntries(byStatusRows.rows.map((r) => [r.status, r.n])),
-      branchesWithBookings: branchesWithBookings.rows[0]!.n,
       khw: Object.fromEntries(khwRows.rows.map((r) => [r.status, r.n])),
       windowDates: window,
       outsideWindow,
@@ -327,6 +414,8 @@ try {
       selectedActionableDate,
       khwConfirmedOnSelectedActionableDate: null,
       eligibility,
+      population,
+      byBranch,
       problems,
     });
 

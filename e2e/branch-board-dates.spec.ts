@@ -1,158 +1,100 @@
-import { execFileSync } from 'node:child_process';
-import { resolve } from 'node:path';
 import { expect, test } from '@playwright/test';
-import { Client } from 'pg';
-import { todayInMuscat } from '@foot-repose/domain';
 import {
-  actionableReferenceDate,
   SEED_CONFIRMED_PER_BRANCH_ON_REFERENCE_DAY,
+  isMuscatDayOff,
 } from '@foot-repose/db';
+import { checkableCards, checkInFirst, login, navigateTo, seedFor } from './board';
+import { readSeedContext } from './seed-context';
 
 /**
- * The real transition, driven on boards dated to different weekdays.
+ * Real UI transitions on a Thursday, a Saturday and across a month boundary —
+ * ALWAYS, not whenever the calendar happens to cooperate.
  *
- * `branch-board.spec.ts` proves the flow on whatever day the suite runs. This
- * proves it on a Thursday-dated board, on a Saturday-dated board, and across
- * the 2026-07-31 → 2026-08-01 month boundary — without waiting for those days
- * to arrive, and without faking a clock.
+ * The previous version generated two cases from offsets `[-1, +1, +2]` around
+ * the process's own `todayInMuscat()`. That had two faults. It could pick
+ * YESTERDAY, and a run crossing Muscat midnight after that date was frozen
+ * would then ask the database to seed a two-day-old reference — which migration
+ * 0005 refuses as historical, failing with no application defect. And which
+ * weekdays it covered depended on the day CI ran: a Friday run happened to
+ * exercise Thursday and Saturday, a Monday run would exercise Sunday and
+ * Tuesday, so "we test Thursday and Saturday" was true of one run rather than
+ * of the suite.
  *
- * The mechanism is the board's own day navigation: the seed is built around an
- * explicit reference date, and the test walks from the board's today to that
- * date using the same next/previous buttons a manager uses.
+ * Both are closed the same way: `globalSetup` resolves every target once, safely
+ * in the future, and writes them to a run-scoped file. Specs read that file,
+ * read the board's ACTUAL date label, and navigate forwards from it. The clock
+ * may advance mid-run; the targets cannot.
  *
- * WHAT CANNOT BE PROVEN, AND WHY: there is no "transition a booking dated on the
- * weekly day off". Every roster omits that day, so the seed places no booking on
- * it at any branch — the empty day IS the behaviour. The nearest honest thing is
- * running the whole suite while today IS that day, which `branch-board.spec.ts`
- * does, and which is exactly the scenario that used to fail.
+ * There is still no Friday-dated transition, and none is faked: the seed places
+ * no booking anywhere on the day off. That emptiness is asserted directly
+ * instead.
  */
-const MANAGER_EMAIL = 'manager.khw@footrepose.example';
-const SEED_PASSWORD = 'FootRepose!Dev1';
-const DB_PACKAGE_DIR = resolve(process.cwd(), 'packages/db');
-
-/**
- * Reference dates reachable from the board's today by at most one click.
- *
- * Migration 0005 refuses a branch-hours override for a past Muscat date and the
- * seed writes one for reference+1, so a reference date before yesterday cannot
- * be seeded at all. These are chosen relative to today for that reason, not for
- * convenience.
- */
-const TODAY = todayInMuscat();
-
-function isoShift(date: string, days: number): string {
-  const d = new Date(`${date}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + days);
-  return d.toISOString().slice(0, 10);
-}
-
-function weekdayName(date: string): string {
-  return ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][
-    new Date(`${date}T00:00:00Z`).getUTCDay()
-  ]!;
-}
-
-function seedFor(referenceDate: string): void {
-  execFileSync('npx', ['tsx', 'src/seed.ts'], {
-    cwd: DB_PACKAGE_DIR,
-    env: { ...process.env, SEED_CONFIRM: 'wipe', SEED_REFERENCE_DATE: referenceDate },
-    stdio: 'pipe',
-    timeout: 180_000,
-  });
-}
-
-async function countCheckInAudits(): Promise<number> {
-  const client = new Client({ connectionString: process.env.DATABASE_URL });
-  await client.connect();
-  try {
-    const result = await client.query(
-      "SELECT count(*)::int AS n FROM audit_logs WHERE action = 'booking.check_in'",
-    );
-    return result.rows[0].n as number;
-  } finally {
-    await client.end();
-  }
-}
-
-async function statusOf(bookingId: string): Promise<string> {
-  const client = new Client({ connectionString: process.env.DATABASE_URL });
-  await client.connect();
-  try {
-    const result = await client.query('SELECT status FROM bookings WHERE id = $1', [bookingId]);
-    return result.rows[0].status as string;
-  } finally {
-    await client.end();
-  }
-}
-
-/**
- * Two offsets that are BOTH seedable and BOTH actionable.
- *
- * -1 is the earliest a live database will accept; +1 and +2 are always fine. At
- * most one of {-1, +1, +2} can be the weekly day off — they are three distinct
- * weekdays — so filtering it out always leaves two. Nothing is skipped: a case
- * that could not exist is never generated in the first place.
- */
-const CASES = [-1, 1, 2]
-  .map((offset) => ({ offset, reference: isoShift(TODAY, offset) }))
-  .filter(({ reference }) => weekdayName(reference) !== 'Friday')
-  .slice(0, 2);
+const context = readSeedContext();
 
 // Serial: each case reseeds the shared database.
 test.describe.configure({ mode: 'serial' });
 
 test.afterAll(() => {
   // Leave the database as globalSetup left it, so spec order cannot matter.
-  seedFor(actionableReferenceDate(TODAY));
+  seedFor(context.baseReference);
 });
 
-for (const { offset, reference } of CASES) {
-  test(`checks in on a board dated ${reference} (${weekdayName(reference)}, offset ${offset})`, async ({
-    page,
-  }) => {
-    seedFor(reference);
-    const auditsBefore = await countCheckInAudits();
+test(`checks in on a future Thursday board (${context.thursday})`, async ({ page }) => {
+  seedFor(context.thursday);
+  await login(page);
+  await navigateTo(page, context.thursday);
+  await expect(checkableCards(page)).toHaveCount(SEED_CONFIRMED_PER_BRANCH_ON_REFERENCE_DAY);
+  await checkInFirst(page);
+});
 
-    await page.goto('/');
-    await expect(page).toHaveURL(/\/login$/);
-    await page.locator('input[type="email"]').fill(MANAGER_EMAIL);
-    await page.locator('input[type="password"]').fill(SEED_PASSWORD);
-    await page.getByRole('button', { name: 'Sign in' }).click();
+test(`checks in on a future Saturday board (${context.saturday})`, async ({ page }) => {
+  seedFor(context.saturday);
+  await login(page);
+  await navigateTo(page, context.saturday);
+  await expect(checkableCards(page)).toHaveCount(SEED_CONFIRMED_PER_BRANCH_ON_REFERENCE_DAY);
+  await checkInFirst(page);
+});
 
-    await expect(page).toHaveURL('http://localhost:3001/');
-    await expect(page.locator('.chip')).toHaveText('Foot Repose Al Khuwair');
+test(`crosses a future month boundary (${context.monthEnd} -> ${context.nextMonthStart})`, async ({
+  page,
+}) => {
+  seedFor(context.monthBoundaryTarget);
+  await login(page);
+  await navigateTo(page, context.monthEnd);
 
-    // The label reads '…' until the first board response lands, so wait for a
-    // real date before reading it — otherwise this races a cold API.
-    await expect(page.locator('.date-label')).toHaveText(/^\d{4}-\d{2}-\d{2}$/);
-    // Walk to the seeded reference date through the real controls.
-    const boardDate = (await page.locator('.date-label').innerText()).trim();
-    expect(boardDate).toBe(TODAY);
-    const button = offset > 0 ? 'Next day' : 'Previous day';
-    for (let step = 0; step < Math.abs(offset); step += 1) {
-      await page.getByRole('button', { name: button }).click();
-    }
-    await expect(page.locator('.date-label')).toHaveText(reference);
+  // Both sides of the boundary observed in the real UI, in both directions —
+  // the label must step from the last day of one month to the first of the
+  // next without skipping, repeating or rolling.
+  await expect(page.locator('.date-label')).toHaveText(context.monthEnd);
+  await page.getByRole('button', { name: 'Next day' }).click();
+  await expect(page.locator('.date-label')).toHaveText(context.nextMonthStart);
+  await page.getByRole('button', { name: 'Previous day' }).click();
+  await expect(page.locator('.date-label')).toHaveText(context.monthEnd);
 
-    const checkable = page.locator('li.booking-card', {
-      has: page.getByRole('button', { name: 'Check in' }),
-    });
-    await expect(checkable).toHaveCount(SEED_CONFIRMED_PER_BRANCH_ON_REFERENCE_DAY);
+  // ...then a real check-in on whichever side actually carries bookings. A
+  // month end that lands on the day off has none, so the target moves to the
+  // first of the next month rather than pretending a booking exists.
+  await navigateTo(page, context.monthBoundaryTarget);
+  await expect(checkableCards(page)).toHaveCount(SEED_CONFIRMED_PER_BRANCH_ON_REFERENCE_DAY);
+  await checkInFirst(page);
+});
 
-    const bookingId = await checkable.first().getAttribute('data-booking-id');
-    expect(bookingId).toBeTruthy();
-    const card = page.locator(`li.booking-card[data-booking-id="${bookingId}"]`);
-    await expect(card.locator('.status')).toHaveText('Confirmed');
+test(`shows an empty board on the weekly day off (${context.dayOff})`, async ({ page }) => {
+  // Seeded FOR the day off, so its neighbours are full and only the day itself
+  // is empty. Without that this would pass against any date at all.
+  seedFor(context.dayOff);
+  expect(isMuscatDayOff(context.dayOff)).toBe(true);
+  await login(page);
 
-    await card.getByRole('button', { name: 'Check in' }).click();
+  await navigateTo(page, context.dayOff);
+  await expect(page.locator('li.booking-card')).toHaveCount(0);
 
-    // The UI shows the server-confirmed state and the next permitted action...
-    await expect(card.locator('.status')).toHaveText('Checked in');
-    await expect(card.getByRole('button', { name: 'Start service' })).toBeVisible();
-    await expect(card.getByRole('button', { name: 'Check in' })).toHaveCount(0);
-    // ...the database agrees...
-    expect(await statusOf(bookingId!)).toBe('checked_in');
-    // ...and the transition was audited exactly once.
-    expect(await countCheckInAudits()).toBe(auditsBefore + 1);
-  });
-}
+  // The PRECEDING day IS populated, which is what makes the emptiness above a
+  // fact about the day off rather than about the seed having failed. It has to
+  // be the preceding one: the seed closes Al Khuwair on the day AFTER its
+  // reference date, so the following day is empty for this branch too — for an
+  // entirely different reason.
+  await page.getByRole('button', { name: 'Previous day' }).click();
+  await expect(page.locator('.date-label')).not.toHaveText(context.dayOff);
+  await expect(page.locator('li.booking-card').first()).toBeVisible();
+});

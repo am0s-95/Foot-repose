@@ -175,6 +175,35 @@ export function futureMonthEnd(today: string, leadDays = 2): string {
   return end.toISOString().slice(0, 10);
 }
 
+export interface MonthBoundaryTargets {
+  /** The last day of a future month. */
+  monthEnd: string;
+  /** The first day of the month after it. */
+  nextMonthStart: string;
+  /**
+   * The side of the boundary that actually has bookings to act on. A month end
+   * that falls on the day off has none, so the target moves to the first of the
+   * next month — either way the seed window spans both months.
+   */
+  actionableTarget: string;
+}
+
+/**
+ * A future month boundary, and the side of it a test can act on.
+ *
+ * Derived, never named: a written-down month boundary stops being seedable once
+ * the calendar passes it, which is the expiring-test defect all over again.
+ */
+export function futureMonthBoundary(today: string, leadDays = 2): MonthBoundaryTargets {
+  const monthEnd = futureMonthEnd(today, leadDays);
+  const nextMonthStart = addDaysToIsoDate(monthEnd, 1);
+  return {
+    monthEnd,
+    nextMonthStart,
+    actionableTarget: isMuscatDayOff(monthEnd) ? nextMonthStart : monthEnd,
+  };
+}
+
 /**
  * Confirmed (checked-in-able) bookings the seed places at ONE branch on the
  * reference day itself. Al Khuwair cannot fall back to tomorrow — the seed

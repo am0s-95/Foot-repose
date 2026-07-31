@@ -102,7 +102,12 @@ can only cover today − 1 forward, whatever day it runs. Full multi-month
 coverage therefore lives in `packages/db/tests/seed-plan.test.ts`, which is pure
 and exhaustive over 62 consecutive dates; `packages/db/src/seed-audit.ts` runs
 the same assertions against real rows, over a FUTURE range so all 62 are
-seedable. It reports four separate eligibility counters — outside branch
+seedable, against a database it REFUSES to share — `SEED_AUDIT_DATABASE_URL`
+must be set and must differ from `DATABASE_URL` and `TEST_DATABASE_URL`, checked
+before anything is wiped. It audits every provider allocation including released
+ones (cancelled and no-show bookings release their claims, and the old
+`released_at IS NULL` filter silently skipped them), and records real per-branch
+counts. It reports four separate eligibility counters — outside branch
 availability, outside provider presence, no branch assignment, no service
 qualification — computed with the application's own `materializeBranchHours` /
 `materializeProviderPresence`, not a weekday-only SQL approximation.
