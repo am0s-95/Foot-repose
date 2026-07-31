@@ -37,6 +37,12 @@ export default defineConfig({
       url: 'http://localhost:3001/login',
       reuseExistingServer: false,
       timeout: 60_000,
+      env: {
+        // [F29] Passed at START, not at build: the branch app's artifact carries
+        // no destination, and it refuses to guess one. This line is what the
+        // deployment has to supply too.
+        API_URL: process.env.API_URL ?? 'http://localhost:3000',
+      },
     },
     {
       command: 'npm run start -w @foot-repose/customer-app',

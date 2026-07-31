@@ -24,6 +24,8 @@
     "next-env.d.ts",
     "next.config.ts",
     "src",
+    "tests",
+    "vitest.config.ts",
     ".next/types/**/*.ts"
   ],
   "exclude": [
