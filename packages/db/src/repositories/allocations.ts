@@ -18,15 +18,36 @@ import { withUnitOfWork, type Queryable } from '../client';
  *    checks "is the provider free?" and then inserts; it inserts, and a GiST
  *    exclusion constraint answers. That is the only answer that survives two
  *    concurrent requests from two processes.
- *  * Every operation takes the SAME global lock order — bookings by id, then
- *    branches, then employees by id, then branch_resources by id — because a
- *    swap that releases one side and claims the other is otherwise a textbook
- *    deadlock. `ORDER BY id ... FOR UPDATE` locks in sorted order regardless of
- *    the plan the planner picks (LockRows sits above Sort), which is what makes
- *    the ordering real rather than hopeful.
+ *  * Every operation takes the SAME global lock order, which is:
+ *
+ *        bookings by id            FOR UPDATE   (lockBookings)
+ *     -> employees by id           FOR UPDATE   (lockIdentities)
+ *     -> branch_resources by id    FOR UPDATE   (lockIdentities)
+ *     -> branches                  FOR SHARE    (assertBranchActive)
+ *
+ *    EMPLOYEE IDENTITIES ARE LOCKED BEFORE RESOURCE IDENTITIES, and the branch
+ *    activity row is checked — and locked FOR SHARE, not FOR UPDATE — only
+ *    AFTER both identity locks are held. An operation that touches only some of
+ *    these takes the same relative order on the subset it does touch;
+ *    `captureBookingRequirements`, for instance, stops after the booking.
+ *
+ *    The order exists because a swap that releases one side and claims the other
+ *    is otherwise a textbook deadlock. `ORDER BY id ... FOR UPDATE` locks in
+ *    sorted order regardless of the plan the planner picks (LockRows sits above
+ *    Sort), which is what makes the ordering real rather than hopeful.
  *
  * The ordered locks are a LIVENESS measure, not the integrity guarantee: their
  * worst case if bypassed is 40P01 and a full rollback, never a double claim.
+ * Integrity is PostgreSQL's — the exclusion constraints and the composite
+ * foreign keys — and it holds whatever order the locks were taken in.
+ *
+ * One consequence of that split shapes the claim writes below: a mirrored
+ * booking value must never make the round trip PostgreSQL -> JavaScript ->
+ * PostgreSQL. `timestamptz` carries microseconds; a JavaScript `Date` carries
+ * milliseconds, so a booking at 10:00:00.123456 comes back as 10:00:00.123 and
+ * an INSERT built from it names a booking row that does not exist. Every claim
+ * therefore copies `starts_at`, `ends_at` and both buffers with an
+ * INSERT ... SELECT FROM bookings, inside the database.
  */
 
 const HOLDING_STATUSES: readonly BookingStatus[] = [
@@ -468,57 +489,69 @@ export async function allocateBooking(
     const resources = await loadResources(tx, booking!.branch_id, input.resourceIds);
     assertRequirementsSatisfied(requirements, resources);
 
-    await insertProviderClaim(tx, booking!, input.employeeId);
+    await insertProviderClaim(tx, booking!.id, input.employeeId);
     for (const resource of resources) {
-      await insertResourceClaim(tx, booking!, resource);
+      await insertResourceClaim(tx, booking!.id, resource);
     }
   });
 }
 
+/**
+ * The two claim writes. Both take a booking ID and nothing else about the
+ * booking, because everything else is read from the booking row BY THE DATABASE.
+ *
+ * The mirrored columns exist so the composite foreign key can prove that a claim
+ * describes its own booking's window; a value that lost precision on the way out
+ * describes a booking that does not exist, and PostgreSQL says so with 23503 on
+ * `provider_allocation_booking_fk` / `resource_allocation_booking_fk`. Copying
+ * inside the database is the only shape that cannot lose precision — a
+ * `timestamptz` never becomes a `Date` and never has to be turned back.
+ *
+ * `branch_id` comes from the same locked booking row rather than from the
+ * caller, so the branch a claim names and the branch the FK checks are one read.
+ * The employee or resource identity stays explicit: this file never chooses one.
+ *
+ * A missing booking inserts zero rows, which is a failure and is raised as one —
+ * the callers all lock the booking first, so a zero here means it disappeared
+ * underneath a held lock and nothing about that is a success.
+ */
 async function insertProviderClaim(
   tx: Queryable,
-  booking: BookingRow,
+  bookingId: string,
   employeeId: string,
 ): Promise<void> {
   // The occupancy is derived by the database from the booking row itself; this
   // statement cannot state one.
-  await tx.query(
+  const result = await tx.query(
     `INSERT INTO booking_provider_allocations
        (booking_id, branch_id, employee_id, b_starts_at, b_ends_at, b_buf_before, b_buf_after)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [
-      booking.id,
-      booking.branch_id,
-      employeeId,
-      booking.starts_at,
-      booking.ends_at,
-      booking.buffer_before_min_snapshot,
-      booking.buffer_after_min_snapshot,
-    ],
+     SELECT b.id, b.branch_id, $2, b.starts_at, b.ends_at,
+            b.buffer_before_min_snapshot, b.buffer_after_min_snapshot
+       FROM bookings b WHERE b.id = $1`,
+    [bookingId, employeeId],
   );
+  if (result.rowCount !== 1) {
+    throw new AllocationError('booking_not_found', 'Booking not found');
+  }
 }
 
 async function insertResourceClaim(
   tx: Queryable,
-  booking: BookingRow,
+  bookingId: string,
   resource: { id: string; resource_type_id: string },
 ): Promise<void> {
-  await tx.query(
+  const result = await tx.query(
     `INSERT INTO booking_resource_allocations
        (booking_id, branch_id, resource_id, resource_type_id,
         b_starts_at, b_ends_at, b_buf_before, b_buf_after)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-    [
-      booking.id,
-      booking.branch_id,
-      resource.id,
-      resource.resource_type_id,
-      booking.starts_at,
-      booking.ends_at,
-      booking.buffer_before_min_snapshot,
-      booking.buffer_after_min_snapshot,
-    ],
+     SELECT b.id, b.branch_id, $2, $3, b.starts_at, b.ends_at,
+            b.buffer_before_min_snapshot, b.buffer_after_min_snapshot
+       FROM bookings b WHERE b.id = $1`,
+    [bookingId, resource.id, resource.resource_type_id],
   );
+  if (result.rowCount !== 1) {
+    throw new AllocationError('booking_not_found', 'Booking not found');
+  }
 }
 
 // ------------------------------------------------------------ reassignment
@@ -562,7 +595,7 @@ export async function reassignProvider(
         'reassign',
       );
     }
-    await insertProviderClaim(tx, booking!, newEmployeeId);
+    await insertProviderClaim(tx, booking!.id, newEmployeeId);
   });
 }
 
@@ -721,7 +754,7 @@ export async function swapProviders(db: Queryable, input: SwapInput): Promise<vo
     await releaseProviderClaims(tx, input.a.bookingId, input.a.expectedAllocationSeqs, 'swap');
     await releaseProviderClaims(tx, input.b.bookingId, input.b.expectedAllocationSeqs, 'swap');
     for (const [booking, employeeId] of targets) {
-      await insertProviderClaim(tx, booking, employeeId);
+      await insertProviderClaim(tx, booking.id, employeeId);
     }
   });
 }
@@ -770,7 +803,7 @@ export async function swapResources(db: Queryable, input: SwapInput): Promise<vo
     await releaseResourceClaims(tx, input.a.bookingId, input.a.expectedAllocationSeqs, 'swap');
     await releaseResourceClaims(tx, input.b.bookingId, input.b.expectedAllocationSeqs, 'swap');
     for (const [booking, resources] of resolved) {
-      for (const resource of resources) await insertResourceClaim(tx, booking, resource);
+      for (const resource of resources) await insertResourceClaim(tx, booking.id, resource);
     }
   });
 }
@@ -783,24 +816,40 @@ export async function swapResources(db: Queryable, input: SwapInput): Promise<vo
  *
  * The rows stay: `released_occupancy` freezes what was actually claimed, so a
  * later reschedule (which cascades the live mirrors) cannot rewrite history.
+ *
+ * TWO TABLES, ONE UNIT. Freeing the provider but not the room is not a partial
+ * success, it is a booking that holds a room nothing will ever release. Issued
+ * straight at a Pool the two UPDATEs are two autocommitted statements on
+ * possibly different connections, so a failure on the second left the first
+ * committed — proven, not assumed. `withUnitOfWork` closes that: a Pool gets one
+ * connection and one real transaction, and a caller who already has a
+ * transaction keeps it and gets a SAVEPOINT, so `applyBookingTransition` remains
+ * ONE atomic status-change-and-release rather than becoming two nested commits.
+ *
+ * Nothing else moves: the same two statements, the same `statement_timestamp()`,
+ * the same `released_at` / `release_reason`, and `released_occupancy` still
+ * written by the database's own guard. A release that fails now leaves the
+ * booking exactly as it found it.
  */
 export async function releaseBookingAllocations(
   db: Queryable,
   bookingId: string,
   reason: string,
 ): Promise<void> {
-  await db.query(
-    `UPDATE booking_provider_allocations
-        SET released_at = statement_timestamp(), release_reason = $2
-      WHERE booking_id = $1 AND released_at IS NULL`,
-    [bookingId, reason],
-  );
-  await db.query(
-    `UPDATE booking_resource_allocations
-        SET released_at = statement_timestamp(), release_reason = $2
-      WHERE booking_id = $1 AND released_at IS NULL`,
-    [bookingId, reason],
-  );
+  await withUnitOfWork(db, async (tx) => {
+    await tx.query(
+      `UPDATE booking_provider_allocations
+          SET released_at = statement_timestamp(), release_reason = $2
+        WHERE booking_id = $1 AND released_at IS NULL`,
+      [bookingId, reason],
+    );
+    await tx.query(
+      `UPDATE booking_resource_allocations
+          SET released_at = statement_timestamp(), release_reason = $2
+        WHERE booking_id = $1 AND released_at IS NULL`,
+      [bookingId, reason],
+    );
+  });
 }
 
 export const HOLDING_BOOKING_STATUSES = HOLDING_STATUSES;

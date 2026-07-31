@@ -460,8 +460,9 @@ anti-join, each with a safe failure direction:
 
 Swaps are **one** operation, not two reassignments: two independent calls each
 release their own side and then collide with the other's committed claim. Every
-allocation operation takes the same global lock order (bookings, then employees,
-then units, each by ascending id) so a swap cannot deadlock, and swaps carry the
+allocation operation takes the same global lock order — bookings, then employees,
+then units, each `FOR UPDATE` by ascending id, and only then the branch row
+`FOR SHARE` — so a swap cannot deadlock, and swaps carry the
 caller's expected allocation sequences **keyed by booking** — a flat list would
 release a third booking's claim and would miss an unlisted live one. Two
 concurrent swaps produce one winner and one `stale` rejection.
