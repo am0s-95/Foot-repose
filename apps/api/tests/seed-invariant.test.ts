@@ -7,8 +7,17 @@ import {
   materializeBranchHours,
   materializeProviderPresence,
   occupancyOf,
+  todayInMuscat,
 } from '@foot-repose/domain';
-import { loadBranchHours, loadProviderSchedule } from '@foot-repose/db';
+import {
+  expectedSeedBookings,
+  futureWeekAnchor,
+  loadBranchHours,
+  loadProviderSchedule,
+  SEED_BRANCH_COUNT,
+  SEED_EMPLOYEE_COUNT,
+  weekFrom,
+} from '@foot-repose/db';
 import { closePool, getPool } from '../src/lib/pool';
 
 const DB_PACKAGE_DIR = fileURLToPath(new URL('../../../packages/db', import.meta.url));
@@ -19,31 +28,86 @@ const DB_PACKAGE_DIR = fileURLToPath(new URL('../../../packages/db', import.meta
  * actually offers, and its price/duration/buffer snapshots equal the
  * offering effective at the booking's start instant.
  */
+/**
+ * Seeded for an EXPLICIT Muscat date, never for "whatever today is".
+ *
+ * These invariants used to run against a dataset whose size depended on the day
+ * the suite happened to execute — so `bookings > 100` held on a Wednesday (161)
+ * and failed on a Friday (95) with nothing in the code having changed. A
+ * Wednesday is the reference date here because it is an ordinary working day;
+ * the weekday-specific behaviour has its own matrix in
+ * `seed-weekday-matrix.test.ts`, including the day off.
+ *
+ * DERIVED, never written down. A pinned date is seedable when it is written and
+ * forbidden once the calendar passes it — migration 0005 refuses a branch-hours
+ * override for a past date, and the seed writes one for reference+1. A fixed
+ * date here would be the same expiring-test defect this branch removes.
+ */
+const REFERENCE_DATE = weekFrom(futureWeekAnchor(todayInMuscat()))[3]!; // Wednesday
+
+function runSeed(referenceDate: string): void {
+  execFileSync('npx', ['tsx', 'src/seed.ts'], {
+    cwd: DB_PACKAGE_DIR,
+    env: {
+      ...process.env,
+      DATABASE_URL: process.env.DATABASE_URL,
+      SEED_CONFIRM: 'wipe',
+      SEED_REFERENCE_DATE: referenceDate,
+    },
+    stdio: 'pipe',
+    timeout: 120_000,
+  });
+}
+
 describe('seed invariants', () => {
   beforeAll(() => {
-    execFileSync('npx', ['tsx', 'src/seed.ts'], {
-      cwd: DB_PACKAGE_DIR,
-      env: {
-        ...process.env,
-        DATABASE_URL: process.env.DATABASE_URL,
-        SEED_CONFIRM: 'wipe',
-      },
-      stdio: 'pipe',
-      timeout: 120_000,
-    });
+    runSeed(REFERENCE_DATE);
   }, 120_000);
 
   afterAll(async () => {
     await closePool();
   });
 
-  it('seeds a non-trivial dataset', async () => {
-    const counts = await getPool().query<{ bookings: number; offerings: number }>(
-      `SELECT (SELECT count(*)::int FROM bookings) AS bookings,
-              (SELECT count(*)::int FROM branch_service_offerings) AS offerings`,
+  it('produces the same dataset when the same reference date is seeded twice', async () => {
+    const snapshot = async (): Promise<Record<string, number>> => {
+      const result = await getPool().query<{ status: string; n: number }>(
+        `SELECT status, count(*)::int AS n FROM bookings GROUP BY status ORDER BY status`,
+      );
+      return Object.fromEntries(result.rows.map((row) => [row.status, row.n]));
+    };
+    const first = await snapshot();
+    runSeed(REFERENCE_DATE);
+    // Determinism is the property the whole fix rests on: if reseeding the same
+    // day could produce a different distribution, an exact expectation would be
+    // no better than the threshold it replaced.
+    expect(await snapshot()).toEqual(first);
+    expect(Object.values(first).reduce((a, b) => a + b, 0)).toBe(
+      expectedSeedBookings(REFERENCE_DATE).total,
     );
-    expect(counts.rows[0]!.bookings).toBeGreaterThan(100);
-    expect(counts.rows[0]!.offerings).toBeGreaterThan(50);
+  }, 180_000);
+
+  it('seeds exactly the dataset the documented rules predict', async () => {
+    const counts = await getPool().query<{
+      bookings: number;
+      offerings: number;
+      branches: number;
+      employees: number;
+    }>(
+      `SELECT (SELECT count(*)::int FROM bookings) AS bookings,
+              (SELECT count(*)::int FROM branch_service_offerings) AS offerings,
+              (SELECT count(*)::int FROM branches) AS branches,
+              (SELECT count(*)::int FROM employees) AS employees`,
+    );
+    // Fixed shape of the fictional company — nothing here varies by date.
+    expect(counts.rows[0]!.branches).toBe(SEED_BRANCH_COUNT);
+    expect(counts.rows[0]!.employees).toBe(SEED_EMPLOYEE_COUNT);
+    // ...and the booking total DERIVED from the seed's own rules for this
+    // reference date, not a threshold chosen to be survivable.
+    expect(counts.rows[0]!.bookings).toBe(expectedSeedBookings(REFERENCE_DATE).total);
+    // 6 services x 11 branches, all current; the history versions carry an
+    // earlier valid_during and are counted here too, so this is a floor with a
+    // reason rather than a round number.
+    expect(counts.rows[0]!.offerings).toBeGreaterThanOrEqual(SEED_BRANCH_COUNT * 6);
   });
 
   it('every booking matches an offering effective in its branch at its start time', async () => {
@@ -552,7 +616,7 @@ describe('seed invariants', () => {
        JOIN booking_provider_allocations a ON a.booking_id = b.id
        ORDER BY b.starts_at, b.id`,
     );
-    expect(bookings.rows.length).toBeGreaterThan(100);
+    expect(bookings.rows.length).toBe(expectedSeedBookings(REFERENCE_DATE).total);
 
     const offShift: string[] = [];
     for (const row of bookings.rows) {

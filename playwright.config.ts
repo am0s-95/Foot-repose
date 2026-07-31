@@ -9,8 +9,13 @@ const chromiumPath = process.env.PW_CHROMIUM_EXECUTABLE;
 
 export default defineConfig({
   testDir: 'e2e',
+  // Seeds for an explicit Muscat reference date rather than for whatever day
+  // the runner starts on — see e2e/global-setup.ts.
+  globalSetup: './e2e/global-setup.ts',
   timeout: 60_000,
   fullyParallel: false,
+  // One worker: the date-matrix spec reseeds the shared database between cases.
+  workers: 1,
   reporter: [['list']],
   use: {
     baseURL: 'http://localhost:3001',

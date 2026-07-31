@@ -25,11 +25,40 @@ import { createPool, withTransaction, type Queryable } from './client';
 import { loadEnv, requireEnv } from './env';
 import { runMigrations } from './migrations';
 import { assertLiveDevelopmentDatabase, prepareSeed } from './seed-guards';
+import { SEED_DAY_PLAN, SEED_ROSTERS } from './seed-plan';
 import { allocateBooking, captureBookingRequirements } from './repositories/allocations';
 import { applyBookingTransition } from './repositories/bookings';
 import { loadBranchHours, loadProviderSchedule } from './repositories/scheduling';
 
 export const SEED_PASSWORD = 'FootRepose!Dev1';
+
+/**
+ * The Muscat operational date the seed builds its three days around.
+ *
+ * Explicit by design. It used to be `todayInMuscat()` with no way in, which
+ * made every seeded dataset a function of the wall clock — so the same
+ * unchanged code produced 161 bookings on a Wednesday and 95 on a Friday, and
+ * tests that asserted anything about volume passed or failed by calendar.
+ * `SEED_REFERENCE_DATE` lets a test state the day it is testing; a developer
+ * running the seed by hand still gets today, which is what they want.
+ */
+export function seedReferenceDate(env: Record<string, string | undefined> = process.env): string {
+  const raw = env.SEED_REFERENCE_DATE?.trim();
+  if (!raw) return todayInMuscat();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    throw new Error(
+      `SEED_REFERENCE_DATE must be an Asia/Muscat calendar date as YYYY-MM-DD; got ${JSON.stringify(raw)}`,
+    );
+  }
+  // Rejects 2026-02-30 and friends: `Date` would silently roll them forward,
+  // and a seed quietly built around a different day than the one requested is
+  // exactly the class of surprise this variable exists to remove.
+  const parsed = new Date(`${raw}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== raw) {
+    throw new Error(`SEED_REFERENCE_DATE is not a real calendar date: ${JSON.stringify(raw)}`);
+  }
+  return raw;
+}
 
 // Deterministic PRNG so reseeding produces the same dataset (dates aside).
 function mulberry32(seed: number): () => number {
@@ -211,7 +240,7 @@ try {
     // ---- versioned offerings: FICTIONAL per-branch variation ----
     // Proves the catalog supports per-branch prices/durations/history; the
     // real company's prices are business data entered later, never invented.
-    const today = todayInMuscat();
+    const today = seedReferenceDate();
     // Validity boundaries sit on Muscat day starts, matching how the API
     // evaluates "effective on date D" (at the start of that Muscat day).
     const currentFrom = muscatDayUtcRange(addDaysToIsoDate(today, -30)).startUtc;
@@ -358,10 +387,9 @@ try {
 
     // Weekly shifts + breaks, batched per provider. Two rosters that never
     // overlap for the same person, in any branch.
-    const ROSTERS = [
-      { days: [0, 1, 2, 3, 4], open: 600, close: 1080, breakOpen: 780, breakClose: 810 },
-      { days: [6, 0, 1, 2, 3], open: 840, close: 1320, breakOpen: 1020, breakClose: 1050 },
-    ] as const;
+    // Defined in seed-plan.ts so the day-off rule and the rosters that create it
+    // cannot drift apart.
+    const ROSTERS = SEED_ROSTERS;
     const insertWeeklyWindows = async (
       employeeId: string,
       rows: { branchId: string; kind: 'shift' | 'break'; dow: number; open: number; close: number }[],
@@ -674,16 +702,13 @@ try {
       return false;
     };
 
-    const DAY_PLAN: { isoDate: string; statuses: BookingStatus[] }[] = [
-      {
-        isoDate: addDaysToIsoDate(today, -1),
-        statuses: ['completed', 'completed', 'completed', 'no_show', 'cancelled'],
-      },
-      {
-        isoDate: today,
-        statuses: ['completed', 'completed', 'in_service', 'checked_in', 'confirmed', 'confirmed'],
-      },
-      { isoDate: addDaysToIsoDate(today, 1), statuses: ['confirmed', 'confirmed', 'confirmed', 'confirmed'] },
+    // Built FROM the shared plan, not alongside it. A second copy of these
+    // status arrays would let the seed and the expected-count rule disagree
+    // silently, which is the whole failure mode seed-plan.ts exists to close.
+    const DAY_PLAN: { isoDate: string; statuses: readonly BookingStatus[] }[] = [
+      { isoDate: addDaysToIsoDate(today, -1), statuses: SEED_DAY_PLAN.yesterday },
+      { isoDate: today, statuses: SEED_DAY_PLAN.today },
+      { isoDate: addDaysToIsoDate(today, 1), statuses: SEED_DAY_PLAN.tomorrow },
     ];
     for (const branchId of branchIds) {
       for (const day of DAY_PLAN) {
