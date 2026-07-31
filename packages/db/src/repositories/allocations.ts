@@ -71,9 +71,11 @@ export type AllocationErrorCode =
   | 'not_qualified_for_service'
   | 'offering_not_effective'
   | 'offering_requirements_not_captured'
+  | 'provider_conflict'
   | 'requirements_not_captured'
   | 'requirements_not_sealed'
   | 'requirements_unsatisfied'
+  | 'resource_conflict'
   | 'resource_inactive'
   | 'resource_type_inactive'
   | 'stale';
@@ -82,8 +84,11 @@ export class AllocationError extends Error {
   constructor(
     readonly code: AllocationErrorCode,
     message: string,
+    /** The database error a conflict was translated from, kept for server-side
+     * diagnosis. Never serialised to a client. */
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(message, options);
     this.name = 'AllocationError';
   }
 }
@@ -496,6 +501,96 @@ export async function allocateBooking(
   });
 }
 
+/** Which table's constraints a claim write may legitimately trip. */
+export type ClaimSide = 'provider' | 'resource';
+
+/**
+ * The ONLY database errors this repository turns into a classified refusal, and
+ * what each becomes.
+ *
+ * These four constraints are the operational "no" — the answer a caller can act
+ * on, because two people asked for the same provider or the same chair. They
+ * were reaching callers as raw `pg` `DatabaseError`s, so every consumer would
+ * have had to know a SQLSTATE and a constraint name to tell "already taken"
+ * apart from "the database is broken".
+ *
+ * THE CONSTRAINT NAME IS THE AUTHORITY, never the SQLSTATE. The same two codes
+ * are raised across this schema for things that are NOT conflicts and must not
+ * be reported as one — measured, not assumed:
+ *
+ *   * `23P01` on `resource_no_double_booking`  -> a real conflict
+ *   * `23P01` from a reschedule cascade         -> the booking move is refused
+ *   * `23505` on `provider_allocation_one_live_idx` -> a real conflict
+ *   * `23505` on `resource_types_code_key`      -> a duplicate catalog code
+ *
+ * Anything not listed here — `23503` mirror failures, `23514` window checks,
+ * `P0001` eligibility triggers, `40P01` deadlocks, `40001` serialisation
+ * failures, and every error nobody has classified yet — is rethrown untouched.
+ * Message text is never parsed: it is localised and it is not a contract.
+ *
+ * Exported because `resource_allocation_one_live_idx` is NOT reachable through
+ * any public repository operation (see the note on `insertResourceClaim`), so
+ * its mapping is proved here at the translator boundary rather than by weakening
+ * a fixture or dropping a constraint to reach it.
+ */
+const CLAIM_CONFLICTS: ReadonlyMap<
+  string,
+  { side: ClaimSide; code: AllocationErrorCode; message: string }
+> = new Map([
+  [
+    'provider_no_double_booking',
+    {
+      side: 'provider' as const,
+      code: 'provider_conflict' as const,
+      message: 'The provider is already allocated for an overlapping time',
+    },
+  ],
+  [
+    'provider_allocation_one_live_idx',
+    {
+      side: 'provider' as const,
+      code: 'provider_conflict' as const,
+      message: 'This booking already has a live provider allocation',
+    },
+  ],
+  [
+    'resource_no_double_booking',
+    {
+      side: 'resource' as const,
+      code: 'resource_conflict' as const,
+      message: 'The resource is already allocated for an overlapping time',
+    },
+  ],
+  [
+    'resource_allocation_one_live_idx',
+    {
+      side: 'resource' as const,
+      code: 'resource_conflict' as const,
+      message: 'This booking already has a live allocation for this resource',
+    },
+  ],
+]);
+
+/**
+ * The classified refusal for a claim-write failure, or `null` when this is not
+ * one of the four known conflicts and must be rethrown unchanged.
+ *
+ * The message is fixed and safe: no SQL, no table name, no constraint, no UUID,
+ * no PostgreSQL detail. The original `DatabaseError` is carried as the error
+ * CAUSE — SQLSTATE, constraint, detail and stack all intact for a server log —
+ * and nothing serialises a cause to a client.
+ *
+ * `side` is checked as well as the name, so a provider write cannot be reported
+ * as a resource conflict even if the two schemas ever share a constraint name.
+ */
+export function classifyClaimConflict(error: unknown, side: ClaimSide): AllocationError | null {
+  const constraint = (error as { constraint?: unknown } | null | undefined)?.constraint;
+  if (typeof constraint !== 'string') return null;
+  const known = CLAIM_CONFLICTS.get(constraint);
+  if (known === undefined || known.side !== side) return null;
+  return new AllocationError(known.code, known.message, { cause: error });
+}
+
 /**
  * The two claim writes. Both take a booking ID and nothing else about the
  * booking, because everything else is read from the booking row BY THE DATABASE.
@@ -514,7 +609,34 @@ export async function allocateBooking(
  * A missing booking inserts zero rows, which is a failure and is raised as one —
  * the callers all lock the booking first, so a zero here means it disappeared
  * underneath a held lock and nothing about that is a success.
+ *
+ * These two statements are also the ONE place a conflict is classified. The
+ * translation sits here rather than around each public operation because this is
+ * where the constraints actually fire, so every path — allocate, reassign, both
+ * swaps, the seed — inherits it without a single extra `catch`. A translated
+ * conflict is still a thrown error: it aborts and rolls the whole unit of work
+ * back exactly as the raw one did, and nothing is retried. PostgreSQL remains
+ * the concurrency authority; this only names its answer.
  */
+async function claimInsert(
+  tx: Queryable,
+  side: ClaimSide,
+  sql: string,
+  values: unknown[],
+): Promise<void> {
+  let rowCount: number | null;
+  try {
+    rowCount = (await tx.query(sql, values)).rowCount;
+  } catch (error) {
+    const conflict = classifyClaimConflict(error, side);
+    if (conflict !== null) throw conflict;
+    throw error;
+  }
+  if (rowCount !== 1) {
+    throw new AllocationError('booking_not_found', 'Booking not found');
+  }
+}
+
 async function insertProviderClaim(
   tx: Queryable,
   bookingId: string,
@@ -522,7 +644,9 @@ async function insertProviderClaim(
 ): Promise<void> {
   // The occupancy is derived by the database from the booking row itself; this
   // statement cannot state one.
-  const result = await tx.query(
+  await claimInsert(
+    tx,
+    'provider',
     `INSERT INTO booking_provider_allocations
        (booking_id, branch_id, employee_id, b_starts_at, b_ends_at, b_buf_before, b_buf_after)
      SELECT b.id, b.branch_id, $2, b.starts_at, b.ends_at,
@@ -530,17 +654,27 @@ async function insertProviderClaim(
        FROM bookings b WHERE b.id = $1`,
     [bookingId, employeeId],
   );
-  if (result.rowCount !== 1) {
-    throw new AllocationError('booking_not_found', 'Booking not found');
-  }
 }
 
+/**
+ * Note on `resource_allocation_one_live_idx`: no public operation can reach it.
+ * A duplicate unit in one request is refused by `loadResources` before any write;
+ * re-allocating a booking that already holds claims trips
+ * `provider_allocation_one_live_idx` first, because the provider claim is written
+ * before any unit; and a swap gives each booking the OTHER booking's units, after
+ * releasing its own. Even provoked directly, the same booking and unit twice have
+ * the SAME occupancy, so `resource_no_double_booking` answers first. It is mapped
+ * anyway — a future operation could reach it — and that mapping is proved at
+ * `classifyClaimConflict`, not by weakening a fixture.
+ */
 async function insertResourceClaim(
   tx: Queryable,
   bookingId: string,
   resource: { id: string; resource_type_id: string },
 ): Promise<void> {
-  const result = await tx.query(
+  await claimInsert(
+    tx,
+    'resource',
     `INSERT INTO booking_resource_allocations
        (booking_id, branch_id, resource_id, resource_type_id,
         b_starts_at, b_ends_at, b_buf_before, b_buf_after)
@@ -549,9 +683,6 @@ async function insertResourceClaim(
        FROM bookings b WHERE b.id = $1`,
     [bookingId, resource.id, resource.resource_type_id],
   );
-  if (result.rowCount !== 1) {
-    throw new AllocationError('booking_not_found', 'Booking not found');
-  }
 }
 
 // ------------------------------------------------------------ reassignment

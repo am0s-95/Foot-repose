@@ -467,6 +467,20 @@ caller's expected allocation sequences **keyed by booking** — a flat list woul
 release a third booking's claim and would miss an unlisted live one. Two
 concurrent swaps produce one winner and one `stale` rejection.
 
+An **expected** conflict is an answer, not a crash. Four exact constraint names —
+`provider_no_double_booking`, `provider_allocation_one_live_idx`,
+`resource_no_double_booking`, `resource_allocation_one_live_idx` — are translated
+at the claim-insert boundary into `AllocationError` with code `provider_conflict`
+or `resource_conflict` and a fixed message carrying no SQL, table, constraint or
+id; the original `DatabaseError` survives as the error **cause** for the server
+log. The mapping is keyed on the constraint **name**, never on the SQLSTATE: the
+same `23P01` is also raised when a reschedule cascade is refused, and the same
+`23505` by a duplicate catalog code, and neither is a claim conflict. Everything
+else — `23503` mirror failures, `23514` window checks, `P0001` eligibility
+triggers, `40P01`, `40001`, and anything unclassified — is rethrown untouched.
+PostgreSQL still decides; nothing is pre-checked and nothing is retried, and a
+classified conflict still rolls its whole transaction back.
+
 Honest limits recorded in code and tests: temporal effectiveness of the source
 offering is proved **at capture time only** — a later reschedule does not
 re-prove it, and slice 2B must revalidate or deliberately keep the original
@@ -479,6 +493,22 @@ service-replacement operation in this slice: changing the service of a booking
 that has ever held a provider or a unit would have to re-snapshot name, duration
 and price, re-capture requirements from the new offering and re-allocate, so
 until that exists a different service means a different booking.
+
+Two precision limits are **recorded and deliberately unfixed**. First, the
+JavaScript eligibility precheck derives the Muscat dates a claim occupies with
+`endUtc - 1 millisecond`, while the PostgreSQL guard uses
+`upper(occupancy) - interval '1 microsecond'`. For an occupancy ending in the
+first 999 microseconds after Muscat midnight the two disagree about the last
+date, and PostgreSQL — being the stricter of the two — can refuse a claim the
+precheck allowed. The failure direction is safe: the database is the final
+integrity boundary and no invalid claim is ever written. What reaches the caller
+in that case is a `P0001` trigger error with no stable constraint identifier, so
+it is **not** classified; its message is never parsed. Second,
+`captureBookingRequirements` still passes a JavaScript `Date` into the
+offering-effectiveness query, so a sub-millisecond `valid_during` boundary would
+be compared against a truncated instant. Neither is a claim mirror and no foreign
+key compares either, so neither affects claim integrity; both need their own
+investigation.
 
 ## Checks
 
