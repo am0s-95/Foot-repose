@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
 import { todayInMuscat } from '@foot-repose/domain';
+import { futureMonthEnd, futureWeekAnchor, weekFrom } from '@foot-repose/db';
 import { closePool, getPool } from '../src/lib/pool';
 
 const DB_PACKAGE_DIR = fileURLToPath(new URL('../../../packages/db', import.meta.url));
@@ -21,12 +22,26 @@ const DB_PACKAGE_DIR = fileURLToPath(new URL('../../../packages/db', import.meta
  * nothing depends on their values. Everything that carries meaning is compared:
  * branch, provider, service, status, and the exact start and end instants.
  */
+/**
+ * Derived from a future anchor, never written down — a pinned date here would
+ * stop being seedable as soon as the calendar passed it.
+ *
+ * The selection covers every weekday SHAPE the rule distinguishes, plus a
+ * month boundary:
+ *
+ *   * Thursday  — tomorrow is the day off, so tomorrow contributes nothing;
+ *   * Friday    — the day off itself, which seeds nothing on the day;
+ *   * Saturday  — yesterday is the day off;
+ *   * Sunday    — an ordinary day with three full contributions;
+ *   * a month end — whose seed window straddles two months.
+ */
+const WEEK = weekFrom(futureWeekAnchor(todayInMuscat()));
 const REFERENCE_DATES = [
-  '2026-07-30',
-  '2026-07-31',
-  '2026-08-01',
-  '2026-08-02',
-  '2026-08-31',
+  WEEK[4]!, // Thursday
+  WEEK[5]!, // Friday — the day off
+  WEEK[6]!, // Saturday
+  WEEK[0]!, // Sunday
+  futureMonthEnd(todayInMuscat()),
 ] as const;
 
 function seedFor(referenceDate: string): void {
@@ -95,9 +110,9 @@ describe('reseeding the same reference date reproduces the same dataset', () => 
       expect(second.bookings).toEqual(first.bookings);
       expect(second.perBranch).toEqual(first.perBranch);
       expect(second.perStatus).toEqual(first.perStatus);
-      // A non-empty snapshot, so an empty-equals-empty pass is impossible —
-      // except on the day off, which legitimately seeds nothing on the day
-      // itself and is covered by the weekday matrix.
+      // A non-empty snapshot, so an empty-equals-empty pass is impossible. A
+      // day-off reference date still seeds its neighbouring days, so this holds
+      // for every case here.
       expect(first.bookings.length).toBeGreaterThan(0);
     },
     600_000,
@@ -108,7 +123,8 @@ describe('reseeding the same reference date reproduces the same dataset', () => 
     // override for a past Muscat date ("past days are history"), and the seed
     // writes one for reference+1. So an arbitrary historical date is NOT
     // seedable against a live database, and any multi-month audit that claims
-    // to have seeded one is wrong. 2026-07-01 is in that category.
+    // to have seeded one is wrong — which is why every date above is derived
+    // from a future anchor rather than written down.
     const earliestSeedable = todayInMuscat();
     expect(() => seedFor('2020-01-01')).toThrow();
     expect(earliestSeedable > '2020-01-02').toBe(true);

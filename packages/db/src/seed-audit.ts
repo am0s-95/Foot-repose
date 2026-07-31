@@ -8,12 +8,32 @@
  * are too slow to run on every push — so this lives here as a script, is run
  * deliberately, and its result is reported rather than assumed.
  *
- *   npx tsx packages/db/src/seed-audit.ts 2026-07-01 2026-08-31
+ *   DATABASE_URL=...foot_repose_audit_local \\
+ *     npx tsx packages/db/src/seed-audit.ts 2026-12-01 2027-01-31
+ *
+ * Give it a database of its own. It wipes and reseeds once per date, so sharing
+ * one with a running test suite makes both wrong in ways that look like
+ * non-determinism — observed exactly once, while this was pointed at the same
+ * database a determinism test was using.
+ *
+ * The range must be in the FUTURE. Migration 0005 refuses a branch-hours
+ * override for a past Muscat date and the seed writes one for reference+1, so a
+ * historical range cannot be seeded at all — the script reports which dates it
+ * had to skip rather than pretending otherwise.
  */
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { addDaysToIsoDate, todayInMuscat } from '@foot-repose/domain';
-import { createPool } from './client';
+import {
+  addDaysToIsoDate,
+  intersectIntervals,
+  intervalsContain,
+  materializeBranchHours,
+  materializeProviderPresence,
+  occupancyOf,
+  todayInMuscat,
+} from '@foot-repose/domain';
+import { createPool, type Queryable } from './client';
+import { loadBranchHours, loadProviderSchedule } from './repositories/scheduling';
 import { loadEnv, requireEnv } from './env';
 import {
   actionableReferenceDate,
@@ -46,9 +66,135 @@ interface Row {
   khw: Record<string, number>;
   windowDates: string[];
   outsideWindow: string[];
-  actionableDate: string;
-  actionableCount: number;
+  /** Confirmed Al Khuwair bookings ON the date THIS row was seeded for. */
+  khwConfirmedOnReferenceDate: number;
+  /** The reference date the e2e rule would pick if today were this date. */
+  selectedActionableDate: string;
+  /**
+   * Confirmed Al Khuwair bookings on that selected date — filled in AFTER the
+   * loop, from the row produced when THAT date was itself seeded. It cannot be
+   * read from this row: a day-off dataset has no Saturday KHW bookings, because
+   * the seed closes Al Khuwair on the day after its reference date.
+   */
+  khwConfirmedOnSelectedActionableDate: number | null;
+  eligibility: {
+    outsideBranchAvailability: number;
+    outsideProviderPresence: number;
+    withoutBranchAssignment: number;
+    withoutServiceQualification: number;
+  };
   problems: string[];
+}
+
+
+interface EligibilityCounters {
+  outsideBranchAvailability: number;
+  outsideProviderPresence: number;
+  withoutBranchAssignment: number;
+  withoutServiceQualification: number;
+}
+
+/**
+ * Four separate answers, because "the booking is fine" is four different claims
+ * and a single counter cannot say which one failed.
+ *
+ * Availability is materialised the way the API materialises it —
+ * `loadBranchHours` + `materializeBranchHours` and `loadProviderSchedule` +
+ * `materializeProviderPresence` — so day overrides, extra shifts and breaks are
+ * all honoured. The comparison is against the FULL buffered occupancy, not the
+ * service window: prep time before opening is still outside opening hours.
+ */
+async function auditEligibility(db: Queryable): Promise<EligibilityCounters> {
+  const counters: EligibilityCounters = {
+    outsideBranchAvailability: 0,
+    outsideProviderPresence: 0,
+    withoutBranchAssignment: 0,
+    withoutServiceQualification: 0,
+  };
+
+  const live = await db.query<{
+    branch_id: string;
+    employee_id: string;
+    service_id: string;
+    starts_at: Date;
+    ends_at: Date;
+    buffer_before: number;
+    buffer_after: number;
+    muscat_date: string;
+  }>(
+    `SELECT b.branch_id, a.employee_id, b.service_id, b.starts_at, b.ends_at,
+            b.buffer_before_min_snapshot AS buffer_before,
+            b.buffer_after_min_snapshot  AS buffer_after,
+            (lower(a.occupancy) AT TIME ZONE 'Asia/Muscat')::date::text AS muscat_date
+       FROM booking_provider_allocations a
+       JOIN bookings b ON b.id = a.booking_id
+      WHERE a.released_at IS NULL
+      ORDER BY b.starts_at`,
+  );
+
+  // Cached per (branch|date) and (employee|date): the seed places many bookings
+  // on the same few days, and re-materialising per row would dominate runtime.
+  const branchCache = new Map<string, Awaited<ReturnType<typeof materializeBranchHours>>>();
+  const presenceCache = new Map<string, ReturnType<typeof materializeProviderPresence>>();
+
+  for (const row of live.rows) {
+    const occupancy = occupancyOf({
+      startsAt: row.starts_at,
+      endsAt: row.ends_at,
+      bufferBeforeMin: row.buffer_before,
+      bufferAfterMin: row.buffer_after,
+    });
+
+    const branchKey = `${row.branch_id}|${row.muscat_date}`;
+    if (!branchCache.has(branchKey)) {
+      branchCache.set(
+        branchKey,
+        materializeBranchHours({
+          isoDate: row.muscat_date,
+          ...(await loadBranchHours(db, row.branch_id, row.muscat_date)),
+        }),
+      );
+    }
+    const branchHours = branchCache.get(branchKey)!;
+
+    const presenceKey = `${row.employee_id}|${row.muscat_date}`;
+    if (!presenceCache.has(presenceKey)) {
+      presenceCache.set(
+        presenceKey,
+        materializeProviderPresence({
+          isoDate: row.muscat_date,
+          ...(await loadProviderSchedule(db, row.employee_id, row.muscat_date)),
+        }),
+      );
+    }
+    const presence = presenceCache
+      .get(presenceKey)!
+      .filter((window) => window.branchId === row.branch_id);
+
+    if (!intervalsContain(branchHours, [occupancy])) counters.outsideBranchAvailability += 1;
+    if (!intervalsContain(presence, [occupancy])) counters.outsideProviderPresence += 1;
+    // And inside BOTH at once, which is stricter than each separately.
+    if (!intervalsContain(intersectIntervals(branchHours, presence), [occupancy])) {
+      // Already counted above; nothing extra to record, the two counters
+      // together identify which side failed.
+    }
+
+    const assignment = await db.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM provider_branch_assignments
+        WHERE employee_id = $1 AND branch_id = $2 AND valid_dates @> $3::date`,
+      [row.employee_id, row.branch_id, row.muscat_date],
+    );
+    if (assignment.rows[0]!.n === 0) counters.withoutBranchAssignment += 1;
+
+    const qualification = await db.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM provider_service_qualifications
+        WHERE employee_id = $1 AND service_id = $2 AND valid_dates @> $3::date`,
+      [row.employee_id, row.service_id, row.muscat_date],
+    );
+    if (qualification.rows[0]!.n === 0) counters.withoutServiceQualification += 1;
+  }
+
+  return counters;
 }
 
 loadEnv();
@@ -56,8 +202,8 @@ const databaseUrl = requireEnv('DATABASE_URL');
 const pool = createPool(databaseUrl);
 
 const [, , fromArg, toArg] = process.argv;
-const from = fromArg ?? '2026-07-01';
-const to = toArg ?? '2026-08-31';
+const from = fromArg ?? '2026-12-01';
+const to = toArg ?? '2027-01-31';
 const dates = datesBetween(from, to);
 
 /**
@@ -116,32 +262,30 @@ try {
     const branchesWithBookings = await pool.query<{ n: number }>(
       'SELECT count(DISTINCT branch_id)::int AS n FROM bookings',
     );
-    const actionableDate = actionableReferenceDate(date);
-    // What the e2e test would find IF this date were the reference: the
-    // actionable day is only meaningful for the date the seed was built around.
-    const actionable = await pool.query<{ n: number }>(
+    const selectedActionableDate = actionableReferenceDate(date);
+    // Confirmed Al Khuwair bookings on THIS row's own reference date. The field
+    // used to be called `actionableCount` while querying `date` — the name
+    // promised the selected actionable date and the SQL delivered the seeded
+    // one, which are different dates whenever the reference date is the day
+    // off. The two are now separate fields, and the second is filled in after
+    // the loop from the row where that date was actually seeded.
+    const khwConfirmed = await pool.query<{ n: number }>(
       `SELECT count(*)::int AS n
          FROM bookings bk JOIN branches b ON b.id = bk.branch_id
         WHERE b.code = $1 AND bk.status = 'confirmed'
           AND (bk.starts_at AT TIME ZONE 'Asia/Muscat')::date = $2::date`,
       [SEED_CLOSED_TOMORROW_BRANCH_CODE, date],
     );
-    // Availability: every allocated occupancy must sit inside the branch's
-    // opening hours AND the provider's presence. Checked in SQL against the
-    // materialised inputs the API itself reads.
-    const outsideAvailability = await pool.query<{ n: number }>(
-      `SELECT count(*)::int AS n
-         FROM booking_provider_allocations a
-         JOIN bookings b ON b.id = a.booking_id
-        WHERE a.released_at IS NULL
-          AND NOT EXISTS (
-            SELECT 1 FROM branch_weekly_windows w
-             WHERE w.branch_id = b.branch_id
-               AND w.valid_dates @> (lower(a.occupancy) AT TIME ZONE 'Asia/Muscat')::date
-               AND w.day_of_week =
-                   EXTRACT(DOW FROM (lower(a.occupancy) AT TIME ZONE 'Asia/Muscat'))::int
-          )`,
-    );
+
+    // Eligibility, using the APPLICATION's own scheduling semantics rather than
+    // a weekday-only SQL approximation. The previous check compared each
+    // occupancy against a matching `branch_weekly_windows` row, which ignored
+    // day overrides and provider presence entirely while the comment claimed
+    // both were verified. These four counters are computed the way the seed and
+    // the API compute availability: materialise the branch's hours and the
+    // provider's presence for the occupancy's Muscat date, then ask whether the
+    // full buffered occupancy fits inside their intersection.
+    const eligibility = await auditEligibility(pool as unknown as Queryable);
 
     const actualTotal = byDate.rows.reduce((sum, r) => sum + r.n, 0);
     const window = [addDaysToIsoDate(date, -1), date, addDaysToIsoDate(date, 1)];
@@ -161,10 +305,12 @@ try {
       if (got !== expected[key]) problems.push(`${key} (${d}) ${got} != ${expected[key]}`);
     }
     if (outsideWindow.length > 0) problems.push(`bookings outside window: ${outsideWindow.join(',')}`);
-    if (outsideAvailability.rows[0]!.n > 0) {
-      problems.push(`${outsideAvailability.rows[0]!.n} allocation(s) outside branch availability`);
+    for (const [label, count] of Object.entries(eligibility)) {
+      if (count > 0) problems.push(`${count} allocation(s) ${label}`);
     }
-    if (isMuscatDayOff(actionableDate)) problems.push(`actionable date ${actionableDate} is the day off`);
+    if (isMuscatDayOff(selectedActionableDate)) {
+      problems.push(`selected actionable date ${selectedActionableDate} is the day off`);
+    }
     if (branchesWithBookings.rows[0]!.n > SEED_BRANCH_COUNT) problems.push('more branches than exist');
 
     rows.push({
@@ -177,16 +323,19 @@ try {
       khw: Object.fromEntries(khwRows.rows.map((r) => [r.status, r.n])),
       windowDates: window,
       outsideWindow,
-      actionableDate,
-      actionableCount: actionable.rows[0]!.n,
+      khwConfirmedOnReferenceDate: khwConfirmed.rows[0]!.n,
+      selectedActionableDate,
+      khwConfirmedOnSelectedActionableDate: null,
+      eligibility,
       problems,
     });
 
     const mark = problems.length === 0 ? 'ok ' : 'BAD';
     console.log(
       `${mark} ${date} ${weekdayName(date).padEnd(9)} expected=${String(expected.total).padStart(3)} ` +
-        `actual=${String(actualTotal).padStart(3)} actionable=${actionableDate} ` +
-        `khwConfirmed=${actionable.rows[0]!.n}${problems.length ? ` :: ${problems.join('; ')}` : ''}`,
+        `actual=${String(actualTotal).padStart(3)} selectedActionable=${selectedActionableDate} ` +
+        `khwConfirmedOnRef=${khwConfirmed.rows[0]!.n}` +
+        `${problems.length ? ` :: ${problems.join('; ')}` : ''}`,
     );
   }
 } finally {
@@ -194,6 +343,39 @@ try {
 }
 
 const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+
+/**
+ * Associate each row's SELECTED actionable date with the count measured when
+ * that date was itself the reference date.
+ *
+ * This is the correction the old field name papered over. For a day-off source
+ * date the rule selects the following Saturday, and the day-off dataset has no
+ * Al Khuwair bookings on that Saturday at all — the seed closes Al Khuwair on
+ * the day after its reference date. Reading the count from the wrong dataset
+ * would have reported 0 and called it a failure, or reported the reference
+ * day's own count and called it the actionable one. Both are wrong; the number
+ * that matters comes from the run where the selected date WAS the reference.
+ */
+const byDateSeeded = new Map(rows.map((row) => [row.date, row]));
+for (const row of rows) {
+  const source = byDateSeeded.get(row.selectedActionableDate);
+  row.khwConfirmedOnSelectedActionableDate = source?.khwConfirmedOnReferenceDate ?? null;
+  if (source !== undefined && row.khwConfirmedOnSelectedActionableDate === 0) {
+    row.problems.push(
+      `selected actionable date ${row.selectedActionableDate} yields no confirmed ` +
+        `${SEED_CLOSED_TOMORROW_BRANCH_CODE} bookings when seeded`,
+    );
+  }
+}
+const unresolved = rows.filter((r) => r.khwConfirmedOnSelectedActionableDate === null);
+if (unresolved.length > 0) {
+  console.log(
+    `NOTE: ${unresolved.length} row(s) select an actionable date outside the audited range ` +
+      `(${unresolved.map((r) => `${r.date}->${r.selectedActionableDate}`).join(', ')}), so their ` +
+      `count could not be taken from a seeded run.`,
+  );
+}
+
 const bad = rows.filter((r) => r.problems.length > 0);
 console.log(
   `\n${rows.length} dates seeded in ${elapsed}s — ${bad.length} mismatch(es); ` +

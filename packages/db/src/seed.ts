@@ -25,6 +25,7 @@ import { createPool, withTransaction, type Queryable } from './client';
 import { loadEnv, requireEnv } from './env';
 import { runMigrations } from './migrations';
 import { assertLiveDevelopmentDatabase, prepareSeed } from './seed-guards';
+import { SEED_DAY_PLAN, SEED_ROSTERS } from './seed-plan';
 import { allocateBooking, captureBookingRequirements } from './repositories/allocations';
 import { applyBookingTransition } from './repositories/bookings';
 import { loadBranchHours, loadProviderSchedule } from './repositories/scheduling';
@@ -386,10 +387,9 @@ try {
 
     // Weekly shifts + breaks, batched per provider. Two rosters that never
     // overlap for the same person, in any branch.
-    const ROSTERS = [
-      { days: [0, 1, 2, 3, 4], open: 600, close: 1080, breakOpen: 780, breakClose: 810 },
-      { days: [6, 0, 1, 2, 3], open: 840, close: 1320, breakOpen: 1020, breakClose: 1050 },
-    ] as const;
+    // Defined in seed-plan.ts so the day-off rule and the rosters that create it
+    // cannot drift apart.
+    const ROSTERS = SEED_ROSTERS;
     const insertWeeklyWindows = async (
       employeeId: string,
       rows: { branchId: string; kind: 'shift' | 'break'; dow: number; open: number; close: number }[],
@@ -702,16 +702,13 @@ try {
       return false;
     };
 
-    const DAY_PLAN: { isoDate: string; statuses: BookingStatus[] }[] = [
-      {
-        isoDate: addDaysToIsoDate(today, -1),
-        statuses: ['completed', 'completed', 'completed', 'no_show', 'cancelled'],
-      },
-      {
-        isoDate: today,
-        statuses: ['completed', 'completed', 'in_service', 'checked_in', 'confirmed', 'confirmed'],
-      },
-      { isoDate: addDaysToIsoDate(today, 1), statuses: ['confirmed', 'confirmed', 'confirmed', 'confirmed'] },
+    // Built FROM the shared plan, not alongside it. A second copy of these
+    // status arrays would let the seed and the expected-count rule disagree
+    // silently, which is the whole failure mode seed-plan.ts exists to close.
+    const DAY_PLAN: { isoDate: string; statuses: readonly BookingStatus[] }[] = [
+      { isoDate: addDaysToIsoDate(today, -1), statuses: SEED_DAY_PLAN.yesterday },
+      { isoDate: today, statuses: SEED_DAY_PLAN.today },
+      { isoDate: addDaysToIsoDate(today, 1), statuses: SEED_DAY_PLAN.tomorrow },
     ];
     for (const branchId of branchIds) {
       for (const day of DAY_PLAN) {

@@ -35,6 +35,26 @@ import { addDaysToIsoDate } from '@foot-repose/domain';
 /** Asia/Muscat weekday index used by the schema: 0 = Sunday … 6 = Saturday. */
 export const MUSCAT_WEEKLY_DAY_OFF = 5; // Friday
 
+/**
+ * The provider rosters the seed writes, and the reason the day off is a fact
+ * rather than a claim.
+ *
+ * These used to live inside `seed.ts`, which meant this module could assert
+ * "Friday is the weekly day off" while an independent edit over there quietly
+ * added it back. One definition, consumed by the production seed and by the
+ * tests that reason about it.
+ *
+ * `days` are schema weekday indexes (0 = Sunday). Neither roster contains
+ * MUSCAT_WEEKLY_DAY_OFF, and a test asserts that rather than trusting the
+ * comment. (One deliberate exception exists in `seed.ts`: three "floater" staff
+ * get a cross-branch shift on the day off. It never produces a booking, because
+ * placement only considers staff whose HOME branch is the one being filled.)
+ */
+export const SEED_ROSTERS = [
+  { days: [0, 1, 2, 3, 4], open: 600, close: 1080, breakOpen: 780, breakClose: 810 },
+  { days: [6, 0, 1, 2, 3], open: 840, close: 1320, breakOpen: 1020, breakClose: 1050 },
+] as const;
+
 export const SEED_BRANCH_COUNT = 11;
 export const SEED_EMPLOYEE_COUNT = 160;
 
@@ -106,6 +126,53 @@ export function actionableReferenceDate(today: string): string {
  */
 export function actionableDayOffset(today: string): number {
   return isMuscatDayOff(today) ? 1 : 0;
+}
+
+/**
+ * A reference date a LIVE database will still accept, safely in the future.
+ *
+ * This exists because the first fix for the calendar problem contained the
+ * calendar problem. The permanent PostgreSQL tests pinned real dates —
+ * 2026-07-30, 2026-08-05 and so on — which were seedable the day they were
+ * written and become forbidden as the Muscat calendar advances past them:
+ * migration 0005 refuses a branch-hours override for a past date, and the seed
+ * writes one for `reference + 1`. Those tests would have gone red on their own,
+ * with no code change, which is exactly the defect this branch exists to remove.
+ *
+ * So live-database tests anchor forward instead. `leadDays` defaults to 2, not
+ * 1, so a run that crosses Muscat midnight between computing the anchor and
+ * seeding still lands on a future date.
+ *
+ * Returns the first SUNDAY at least `leadDays` days from `today`, so
+ * `weekFrom()` yields an aligned Sunday-through-Saturday week — every weekday,
+ * exactly once, always seedable.
+ */
+export function futureWeekAnchor(today: string, leadDays = 2): string {
+  let candidate = addDaysToIsoDate(today, leadDays);
+  while (new Date(`${candidate}T00:00:00Z`).getUTCDay() !== 0) {
+    candidate = addDaysToIsoDate(candidate, 1);
+  }
+  return candidate;
+}
+
+/** The seven dates of the week beginning at `anchor`: Sunday … Saturday. */
+export function weekFrom(anchor: string): string[] {
+  return Array.from({ length: 7 }, (_, offset) => addDaysToIsoDate(anchor, offset));
+}
+
+/**
+ * The first month-end at least `leadDays` away — a seedable date whose seed
+ * window straddles a month boundary, without naming a month that will expire.
+ */
+export function futureMonthEnd(today: string, leadDays = 2): string {
+  const earliest = addDaysToIsoDate(today, leadDays);
+  const probe = new Date(`${earliest}T00:00:00Z`);
+  // Day 0 of the next month is the last day of this one.
+  let end = new Date(Date.UTC(probe.getUTCFullYear(), probe.getUTCMonth() + 1, 0));
+  if (end.toISOString().slice(0, 10) < earliest) {
+    end = new Date(Date.UTC(probe.getUTCFullYear(), probe.getUTCMonth() + 2, 0));
+  }
+  return end.toISOString().slice(0, 10);
 }
 
 /**

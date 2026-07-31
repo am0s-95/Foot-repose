@@ -88,13 +88,24 @@ encodes them so a test can derive the number instead of guessing a threshold:
   first branch on the day after the reference date, so tomorrow contributes ten
   branches rather than eleven.
 
+Live-database tests never pin a date: they derive one from `futureWeekAnchor()`,
+the first Sunday at least two days ahead, and take a full Sunday-to-Saturday
+week from it. A pinned date is seedable when it is written and forbidden once
+the calendar passes it, so it would turn CI red on its own — the same
+expiring-test defect in slower motion. Pure date-contract tests still use fixed
+historical, month-boundary and leap dates, because they write no rows.
+
 **A reference date before yesterday cannot be seeded at all.** Migration 0005
 refuses a branch-hours override for a past Muscat date ("past days are
 history"), and the seed writes one for `reference + 1`. So a live-database audit
 can only cover today − 1 forward, whatever day it runs. Full multi-month
 coverage therefore lives in `packages/db/tests/seed-plan.test.ts`, which is pure
 and exhaustive over 62 consecutive dates; `packages/db/src/seed-audit.ts` runs
-the same assertions against real rows for the seedable sub-range.
+the same assertions against real rows, over a FUTURE range so all 62 are
+seedable. It reports four separate eligibility counters — outside branch
+availability, outside provider presence, no branch assignment, no service
+qualification — computed with the application's own `materializeBranchHours` /
+`materializeProviderPresence`, not a weekday-only SQL approximation.
 
 This used to be undocumented, and the tests asserted `bookings > 100` and "Al
 Khuwair has something to check in today". Both are true most of the week and

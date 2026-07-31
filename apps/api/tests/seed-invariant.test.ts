@@ -7,13 +7,16 @@ import {
   materializeBranchHours,
   materializeProviderPresence,
   occupancyOf,
+  todayInMuscat,
 } from '@foot-repose/domain';
 import {
   expectedSeedBookings,
+  futureWeekAnchor,
   loadBranchHours,
   loadProviderSchedule,
   SEED_BRANCH_COUNT,
   SEED_EMPLOYEE_COUNT,
+  weekFrom,
 } from '@foot-repose/db';
 import { closePool, getPool } from '../src/lib/pool';
 
@@ -34,8 +37,13 @@ const DB_PACKAGE_DIR = fileURLToPath(new URL('../../../packages/db', import.meta
  * Wednesday is the reference date here because it is an ordinary working day;
  * the weekday-specific behaviour has its own matrix in
  * `seed-weekday-matrix.test.ts`, including the day off.
+ *
+ * DERIVED, never written down. A pinned date is seedable when it is written and
+ * forbidden once the calendar passes it — migration 0005 refuses a branch-hours
+ * override for a past date, and the seed writes one for reference+1. A fixed
+ * date here would be the same expiring-test defect this branch removes.
  */
-const REFERENCE_DATE = '2026-08-05'; // Wednesday
+const REFERENCE_DATE = weekFrom(futureWeekAnchor(todayInMuscat()))[3]!; // Wednesday
 
 function runSeed(referenceDate: string): void {
   execFileSync('npx', ['tsx', 'src/seed.ts'], {
