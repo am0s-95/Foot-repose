@@ -76,11 +76,12 @@ export async function navigateTo(page: Page, target: string): Promise<void> {
     `board is at ${from} but the seeded target ${target} is in the past — the run must never seed a past date`,
   ).toBeGreaterThanOrEqual(0);
 
-  // One day at a time, WAITING for each step to land. The board computes the
-  // next date from the last loaded response, not from the pending one, so two
-  // clicks issued before the first fetch resolves both step from the same day
-  // and the walk silently ends a day short. Measured: eleven clicks arrived at
-  // 2026-08-05 instead of 2026-08-06.
+  // One day at a time, WAITING for each step to land — a deliberate choice for
+  // these tests, not a workaround any more. The board now steps from the last
+  // INTENT, so rapid clicking is exact and is proved as such in
+  // `branch-board-rapid-navigation.spec.ts`. Walking day by day here keeps the
+  // seeded-date specs about their own subject: each intermediate board is
+  // observed to land, so a failure names the day it happened on.
   let current = from;
   for (let step = 0; step < steps; step += 1) {
     const next = addDays(current, 1);

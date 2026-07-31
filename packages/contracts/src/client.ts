@@ -47,7 +47,17 @@ export const apiClient = {
     request<EmployeeProfile>('/api/auth/login', { method: 'POST', body: JSON.stringify(input) }),
   logout: () => request<{ ok: true }>('/api/auth/logout', { method: 'POST' }),
   me: () => request<EmployeeProfile>('/api/auth/me'),
-  listBookings: (branchId: string, params: { date?: string; status?: string; q?: string } = {}) => {
+  /**
+   * `signal` lets a caller drop a board request it has already superseded —
+   * rapid day navigation issues one per click. It is a courtesy only: a request
+   * can still complete in the instant the abort is signalled, so the caller must
+   * also decide for itself which response is allowed to win.
+   */
+  listBookings: (
+    branchId: string,
+    params: { date?: string; status?: string; q?: string } = {},
+    signal?: AbortSignal,
+  ) => {
     const search = new URLSearchParams();
     if (params.date) search.set('date', params.date);
     if (params.status) search.set('status', params.status);
@@ -55,6 +65,7 @@ export const apiClient = {
     const qs = search.toString();
     return request<BookingsListResponse>(
       `/api/branches/${branchId}/bookings${qs ? `?${qs}` : ''}`,
+      signal ? { signal } : undefined,
     );
   },
   transition: (bookingId: string, action: BookingAction) =>
