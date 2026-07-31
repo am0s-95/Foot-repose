@@ -82,7 +82,11 @@ describe('what PostgreSQL refuses', () => {
           resourceIds: [fx.chairA2],
         }),
       ),
-    ).toBe('23P01');
+      // The exclusion constraint is still the one refusing; since [P5] the
+      // repository translates that one constraint into a stable code. The raw
+      // SQLSTATE and constraint survive as the error cause, asserted in
+      // allocation-conflicts.test.ts.
+    ).toBe('provider_conflict');
     expect(await liveSeqs('booking_provider_allocations', second)).toEqual([]);
   });
 
@@ -115,7 +119,8 @@ describe('what PostgreSQL refuses', () => {
       await sqlstateOf(() =>
         allocateBooking(getPool(), second, { employeeId: fx.staffB.id, resourceIds: [fx.chairA1] }),
       ),
-    ).toBe('23P01');
+    ).toBe('resource_conflict'); // [P5] was the raw 23P01
+
     // A different unit of the same type -> accepted. This is the difference
     // between individually allocatable units and a capacity counter.
     await allocateBooking(getPool(), second, { employeeId: fx.staffB.id, resourceIds: [fx.chairA2] });
@@ -135,7 +140,8 @@ describe('what PostgreSQL refuses', () => {
       await sqlstateOf(() =>
         allocateBooking(getPool(), tooSoon, { employeeId: fx.staffA.id, resourceIds: [fx.chairA2] }),
       ),
-    ).toBe('23P01');
+    ).toBe('provider_conflict'); // [P5] was the raw 23P01
+
 
     const justFits = await book({ hour: 10, minute: 55 });
     await captureBookingRequirements(getPool(), justFits);
@@ -851,7 +857,7 @@ describe('eligibility, checked under lock [R3-3 / C9.4 / C9.5]', () => {
           resourceIds: [fx.chairA2, fx.chairA1],
         }),
       ).catch(() => 'threw'),
-    ).toBe('23P01');
+    ).toBe('resource_conflict'); // [P5] was the raw 23P01
     // Nothing survived: not the provider claim, not the first unit.
     expect(await liveSeqs('booking_provider_allocations', second)).toEqual([]);
     expect(await liveSeqs('booking_resource_allocations', second)).toEqual([]);

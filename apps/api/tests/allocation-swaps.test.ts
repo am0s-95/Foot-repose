@@ -976,7 +976,9 @@ describe('two concurrent calls to the swap itself', () => {
       // exclusion constraint doing the deciding, not application code.
       expect(await waitUntilBlockedBy(pool, pid2)).toContain(pid1);
       await c1.query('COMMIT');
-      expect(await pending).toBe('23P01');
+      // Classified, not raw: PostgreSQL still decided (the wait above is the
+      // proof), and the repository names its answer. [P5]
+      expect(await pending).toBe('provider_conflict');
       await c2.query('ROLLBACK').catch(() => undefined);
     } finally {
       c1.release();
