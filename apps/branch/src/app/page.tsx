@@ -54,7 +54,8 @@ export default function BoardPage() {
   /** A refused transition, kept apart from the board request's own error so one
    * cannot silently stand in for the other. */
   const [actionNotice, setActionNotice] = useState<string | null>(null);
-  const { branchId, statusFilter, generation, targetDate, query, loading, error } = state;
+  const { branchId, statusFilter, generation, targetDate, query, loading, error, authRequired } =
+    state;
 
   const toLogin = useCallback(async (): Promise<void> => {
     // Clear the (stale) cookie first, or the middleware bounces us back.
@@ -107,7 +108,9 @@ export default function BoardPage() {
         // error, so it is not reported at all.
         if (controller.signal.aborted) return;
         if (failure instanceof ApiError && failure.status === 401) {
-          void toLogin();
+          // Dispatched, never called from here: signing the user out is an
+          // external side effect, and only the CURRENT request may cause one.
+          dispatch({ type: 'unauthorized', generation });
           return;
         }
         dispatch({
@@ -120,7 +123,13 @@ export default function BoardPage() {
     // `generation` changes on every navigation, filter change and refresh; the
     // rest are listed because they are read above and are stable between bumps.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [generation, branchId, targetDate, statusFilter, query, toLogin]);
+  }, [generation, branchId, targetDate, statusFilter, query]);
+
+  /** The one place the board hands over to the login flow, driven by state the
+   * reducer accepted — so it runs once, and only for the current request. */
+  useEffect(() => {
+    if (authRequired) void toLogin();
+  }, [authRequired, toLogin]);
 
   const runAction = useCallback(
     async (booking: BookingDto, action: BookingAction): Promise<void> => {

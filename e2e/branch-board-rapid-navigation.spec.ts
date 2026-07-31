@@ -65,6 +65,7 @@ class BoardApi {
   private readonly gates = new Map<string, Gate>();
   private hold = false;
   private failures = new Set<string>();
+  private unauthorized = new Set<string>();
 
   static async install(page: Page): Promise<BoardApi> {
     const api = new BoardApi();
@@ -75,6 +76,16 @@ class BoardApi {
       const gate = api.gateFor(date);
       gate.arrived();
       if (api.hold) await gate.reached;
+      if (api.unauthorized.has(date)) {
+        await route.fulfill({
+          status: 401,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            error: { code: 'unauthorized', message: 'Session expired' },
+          }),
+        });
+        return;
+      }
       if (api.failures.has(date)) {
         await route.fulfill({
           status: 500,
@@ -116,6 +127,10 @@ class BoardApi {
 
   failOn(date: string): void {
     this.failures.add(date);
+  }
+
+  expireSessionOn(date: string): void {
+    this.unauthorized.add(date);
   }
 
   /** Let one specific date's response through, in the order the test chooses. */
@@ -264,6 +279,62 @@ test('a genuine failure of the LATEST request is shown, and navigation still wor
   await expect(label(page)).toHaveText(recovered);
   await expect(cards(page)).toHaveText([`Day ${recovered}`]);
   await expect(page.locator('.notice')).toHaveCount(0);
+});
+
+/**
+ * Cancellation is deliberately taken away for these two.
+ *
+ * In production a superseded request is aborted, and an aborted request never
+ * reaches the 401 branch at all — which would make this test prove only that
+ * `signal.aborted` was true. That is not the property under test. Neutralising
+ * `AbortController.prototype.abort` in the page leaves the superseded request to
+ * complete for real, so the ONLY thing that can stop a stale 401 from signing
+ * the user out is the generation check in the reducer. Production code is
+ * untouched; the courtesy mechanism is removed so the authority is what answers.
+ */
+async function withoutCancellation(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    AbortController.prototype.abort = function neutralised(): void {};
+  });
+}
+
+test('a stale 401 cannot sign the user out of a board that has moved on', async ({ page }) => {
+  await withoutCancellation(page);
+  const api = await openBoard(page);
+  api.holdEverything();
+
+  const first = addDays(BASE, 1);
+  const second = addDays(BASE, 2);
+  api.expireSessionOn(first);
+
+  // The older request is in flight and will come back 401...
+  await clickRapidly(page, ['next']);
+  await api.waitForRequest(first);
+  // ...and the user has already navigated past it.
+  await clickRapidly(page, ['next']);
+  await api.waitForRequest(second);
+
+  api.release(second);
+  await expect(cards(page)).toHaveText([`Day ${second}`]);
+
+  api.release(first); // the stale 401 settles, uncancelled
+  await page.waitForTimeout(500); // every chance to redirect
+
+  await expect(page).toHaveURL('http://localhost:3001/');
+  await expect(label(page)).toHaveText(second);
+  await expect(cards(page)).toHaveText([`Day ${second}`]);
+  await expect(page.locator('.notice')).toHaveCount(0);
+});
+
+test('a 401 on the LATEST request still hands over to the login flow', async ({ page }) => {
+  await withoutCancellation(page);
+  const api = await openBoard(page);
+  const expired = addDays(BASE, 1);
+  api.expireSessionOn(expired);
+
+  await clickRapidly(page, ['next']);
+
+  await expect(page).toHaveURL(/\/login$/);
 });
 
 test('the rendered cards always belong to the rendered date', async ({ page }) => {

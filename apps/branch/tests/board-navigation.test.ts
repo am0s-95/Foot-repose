@@ -224,6 +224,80 @@ describe('[NAV] only the newest request may commit', () => {
     expect(recovered.loading).toBe(true);
   });
 
+  it('[NAV-AUTH-1] a stale unauthorized outcome cannot sign anyone out', () => {
+    const settled = settledOn('2026-08-01');
+    const older = boardReducer(settled, step(1)); // generation N
+    const newer = boardReducer(older, step(1)); // generation N+1
+
+    // The older request's 401 settles after the newer navigation was dispatched.
+    const ignored = boardReducer(newer, { type: 'unauthorized', generation: older.generation });
+    expect(ignored.authRequired).toBe(false);
+    expect(ignored).toBe(newer); // nothing about the newer request moved
+    expect(ignored.loading).toBe(true);
+
+    // ...and the newer request still lands normally afterwards.
+    const landed = boardReducer(ignored, {
+      type: 'loaded',
+      generation: newer.generation,
+      data: response('2026-08-03'),
+    });
+    expect(landed.authRequired).toBe(false);
+    expect(visibleBoard(landed)?.date).toBe('2026-08-03');
+  });
+
+  it('[NAV-AUTH-2] the CURRENT unauthorized outcome hands over exactly once', () => {
+    const pending = boardReducer(settledOn('2026-08-01'), step(1));
+    const unauthorized = boardReducer(pending, {
+      type: 'unauthorized',
+      generation: pending.generation,
+    });
+    expect(unauthorized.authRequired).toBe(true);
+    expect(unauthorized.loading).toBe(false);
+    // It is a flag, not an event: repeating it changes nothing, so the effect
+    // that watches it cannot fire twice.
+    const again = boardReducer(unauthorized, {
+      type: 'unauthorized',
+      generation: unauthorized.generation,
+    });
+    expect(again.authRequired).toBe(true);
+    expect(again).toEqual(unauthorized);
+  });
+
+  it('[NAV-AUTH-3] starting a newer request supersedes a prior unauthorized state', () => {
+    const pending = boardReducer(settledOn('2026-08-01'), step(1));
+    const unauthorized = boardReducer(pending, {
+      type: 'unauthorized',
+      generation: pending.generation,
+    });
+    for (const action of [
+      step(1),
+      { type: 'today' } as const,
+      { type: 'reload' } as const,
+      { type: 'branch', branchId: BRANCH_B } as const,
+      { type: 'status', status: 'completed' } as const,
+    ]) {
+      expect(boardReducer(unauthorized, action).authRequired).toBe(false);
+    }
+  });
+
+  it('[NAV-AUTH-4] a stale unauthorized outcome cannot erase a newer success either', () => {
+    const settled = settledOn('2026-08-01');
+    const older = boardReducer(settled, step(1));
+    const newer = boardReducer(older, step(1));
+    const succeeded = boardReducer(newer, {
+      type: 'loaded',
+      generation: newer.generation,
+      data: response('2026-08-03'),
+    });
+    const afterStale401 = boardReducer(succeeded, {
+      type: 'unauthorized',
+      generation: older.generation,
+    });
+    expect(afterStale401.authRequired).toBe(false);
+    expect(visibleBoard(afterStale401)?.date).toBe('2026-08-03');
+    expect(shownDate(afterStale401)).toBe('2026-08-03');
+  });
+
   it('[NAV-11] changing branch invalidates the former branch response', () => {
     const settled = settledOn('2026-08-01');
     const switched = boardReducer(settled, { type: 'branch', branchId: BRANCH_B });

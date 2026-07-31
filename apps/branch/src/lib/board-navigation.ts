@@ -51,6 +51,17 @@ export interface BoardState {
   committed: CommittedBoard | null;
   loading: boolean;
   error: string | null;
+  /**
+   * The CURRENT request came back unauthorized, so the session is gone and the
+   * board must hand over to the login flow.
+   *
+   * This is state rather than a call made from the request's own catch, and the
+   * distinction is the whole point: signing the user out is an external side
+   * effect, and a superseded request must not be able to perform one. Routing it
+   * through the reducer puts it under the same generation authority as every
+   * other outcome — a stale 401 is still an older failure.
+   */
+  authRequired: boolean;
 }
 
 export type BoardAction =
@@ -62,6 +73,7 @@ export type BoardAction =
   | { type: 'reload' }
   | { type: 'loaded'; generation: number; data: BookingsListResponse }
   | { type: 'failed'; generation: number; message: string }
+  | { type: 'unauthorized'; generation: number }
   | { type: 'booking'; booking: BookingDto };
 
 export function initialBoardState(branchId = ''): BoardState {
@@ -74,13 +86,21 @@ export function initialBoardState(branchId = ''): BoardState {
     committed: null,
     loading: true,
     error: null,
+    authRequired: false,
   };
 }
 
-/** Start a new request: bump the generation, and clear the error that belonged
- * to the request being superseded. */
+/** Start a new request: bump the generation, and clear the outcome — error or
+ * unauthorized — that belonged to the request being superseded. */
 function requesting(state: BoardState, changes: Partial<BoardState>): BoardState {
-  return { ...state, ...changes, generation: state.generation + 1, loading: true, error: null };
+  return {
+    ...state,
+    ...changes,
+    generation: state.generation + 1,
+    loading: true,
+    error: null,
+    authRequired: false,
+  };
 }
 
 export function boardReducer(state: BoardState, action: BoardAction): BoardState {
@@ -132,6 +152,14 @@ export function boardReducer(state: BoardState, action: BoardAction): BoardState
     case 'failed':
       if (action.generation !== state.generation) return state; // superseded
       return { ...state, loading: false, error: action.message };
+
+    case 'unauthorized':
+      // The same test as every other outcome, for the same reason. An older
+      // request whose 401 settles after newer navigation was dispatched must not
+      // sign anyone out — and this decision belongs to the reducer queue, which
+      // is already ordered, rather than to whether an abort has taken effect yet.
+      if (action.generation !== state.generation) return state; // superseded
+      return { ...state, loading: false, authRequired: true };
 
     case 'booking': {
       // A transition result patches the committed board in place. It is not a
