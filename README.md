@@ -494,8 +494,21 @@ that has ever held a provider or a unit would have to re-snapshot name, duration
 and price, re-capture requirements from the new offering and re-allocate, so
 until that exists a different service means a different booking.
 
-Two precision limits are **recorded and deliberately unfixed**. First, the
-JavaScript eligibility precheck derives the Muscat dates a claim occupies with
+**Which offering version applies is decided inside PostgreSQL**, on the booking
+row. `captureBookingRequirements` joins `bookings` to `branch_service_offerings`
+on `o.valid_during @> b.starts_at` and passes only the booking id, because range
+membership at a boundary is exact arithmetic and a JavaScript `Date` cannot carry
+the operand. It used to bind the JavaScript-observed start, and that was measured
+to be wrong, not merely risky: with a version boundary anywhere inside the
+booking's own millisecond, capture **succeeded** and copied the PREVIOUS
+version's price, duration, both buffers and resource requirements, and derived
+`ends_at` from the wrong duration — silently. With a gap before the new version
+it did the opposite and refused a booking that plainly had one. The booking stays
+locked `FOR UPDATE` first and the chosen offering stays `FOR SHARE`, so a
+concurrent repricing still cannot move under the snapshot.
+
+One precision limit remains **recorded and deliberately unfixed**: the JavaScript
+eligibility precheck derives the Muscat dates a claim occupies with
 `endUtc - 1 millisecond`, while the PostgreSQL guard uses
 `upper(occupancy) - interval '1 microsecond'`. For an occupancy ending in the
 first 999 microseconds after Muscat midnight the two disagree about the last
@@ -503,12 +516,7 @@ date, and PostgreSQL — being the stricter of the two — can refuse a claim th
 precheck allowed. The failure direction is safe: the database is the final
 integrity boundary and no invalid claim is ever written. What reaches the caller
 in that case is a `P0001` trigger error with no stable constraint identifier, so
-it is **not** classified; its message is never parsed. Second,
-`captureBookingRequirements` still passes a JavaScript `Date` into the
-offering-effectiveness query, so a sub-millisecond `valid_during` boundary would
-be compared against a truncated instant. Neither is a claim mirror and no foreign
-key compares either, so neither affects claim integrity; both need their own
-investigation.
+it is **not** classified; its message is never parsed.
 
 ## Checks
 

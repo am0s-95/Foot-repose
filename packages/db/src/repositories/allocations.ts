@@ -395,14 +395,37 @@ export async function captureBookingRequirements(
       buffer_after_min: number;
       captured: Date | null;
     }>(
+      // WHICH VERSION IS EFFECTIVE IS DECIDED INSIDE POSTGRESQL, against the
+      // booking row itself. The branch, the service and above all `starts_at`
+      // never leave: only the booking id crosses the JavaScript boundary.
+      //
+      // Range membership at a boundary is exact arithmetic, and a JavaScript
+      // `Date` cannot carry the operand. `valid_during` boundaries are
+      // `timestamptz` with microseconds; a booking at 06:00:00.123456 arrives in
+      // JavaScript as 06:00:00.123, and a version boundary anywhere inside that
+      // millisecond — say .123400 — puts the two on OPPOSITE sides of it. This
+      // was not theoretical: measured on the previous shape, such a booking
+      // silently captured the PREVIOUS version's price, duration, both buffers
+      // and resource requirements, and derived `ends_at` from the wrong
+      // duration, with no error at all. With a gap before the new version, the
+      // truncated instant fell into no version and capture was refused outright
+      // for a booking that plainly had one.
+      //
+      // The booking is already locked FOR UPDATE by `lockBookings` above, so
+      // re-reading it here cannot see a different row, and the offering stays
+      // FOR SHARE OF o exactly as before.
       `SELECT o.id, s.name AS service_name, o.price_baisa, o.duration_min,
               o.buffer_before_min, o.buffer_after_min,
               o.resource_requirements_captured_at AS captured
-       FROM branch_service_offerings o
+       FROM bookings b
+       JOIN branch_service_offerings o
+         ON o.branch_id = b.branch_id
+        AND o.service_id = b.service_id
+        AND o.valid_during @> b.starts_at
        JOIN services s ON s.id = o.service_id
-       WHERE o.branch_id = $1 AND o.service_id = $2 AND o.valid_during @> $3::timestamptz
+       WHERE b.id = $1
        FOR SHARE OF o`,
-      [booking!.branch_id, booking!.service_id, booking!.starts_at],
+      [bookingId],
     );
     if (offering.rowCount === 0) {
       throw new AllocationError(
