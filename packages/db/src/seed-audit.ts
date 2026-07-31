@@ -8,8 +8,11 @@
  * are too slow to run on every push — so this lives here as a script, is run
  * deliberately, and its result is reported rather than assumed.
  *
- *   DATABASE_URL=...foot_repose_audit_local \\
+ *   SEED_AUDIT_DATABASE_URL=postgres://.../foot_repose_audit_local \\
  *     npx tsx packages/db/src/seed-audit.ts 2026-12-01 2027-01-31
+ *
+ * Add --allow-partial-range only when partial evidence is genuinely wanted;
+ * without it, a skipped date or an unresolved actionable date fails the run.
  *
  * Give it a database of its own. It wipes and reseeds once per date, so sharing
  * one with a running test suite makes both wrong in ways that look like
@@ -35,7 +38,11 @@ import {
 import { createPool, type Queryable } from './client';
 import { loadBranchHours, loadProviderSchedule } from './repositories/scheduling';
 import { loadEnv } from './env';
-import { databaseNameOf, resolveAuditDatabaseUrl } from './seed-audit-guard';
+import {
+  checkWeekdayBranchStability,
+  databaseNameOf,
+  resolveAuditDatabaseUrl,
+} from './seed-audit-guard';
 import {
   actionableReferenceDate,
   expectedSeedBookings,
@@ -252,7 +259,9 @@ const databaseUrl = resolveAuditDatabaseUrl();
 console.log(`Audit database: ${databaseNameOf(databaseUrl)}`);
 const pool = createPool(databaseUrl);
 
-const [, , fromArg, toArg] = process.argv;
+const args = process.argv.slice(2).filter((a) => !a.startsWith('--'));
+const allowPartialRange = process.argv.includes('--allow-partial-range');
+const [fromArg, toArg] = args;
 const from = fromArg ?? '2026-12-01';
 const to = toArg ?? '2027-01-31';
 const dates = datesBetween(from, to);
@@ -457,26 +466,73 @@ for (const row of rows) {
   }
 }
 const unresolved = rows.filter((r) => r.khwConfirmedOnSelectedActionableDate === null);
-if (unresolved.length > 0) {
+
+/**
+ * Per-weekday stability of the branch distribution, ASSERTED rather than
+ * observed.
+ *
+ * The script already recorded a byBranch map per date and checked its sum. The
+ * claim that every occurrence of a weekday produced the SAME map was computed
+ * afterwards, by hand, from the JSON — so two Mondays disagreeing would have
+ * been reported as a pass and only noticed if someone looked. That is the same
+ * shape as the original defect: a property believed rather than checked.
+ */
+const { failures: weekdayFailures, canonicalByWeekday } = checkWeekdayBranchStability(rows);
+
+const rangeFailures: string[] = [];
+if (!allowPartialRange) {
+  // An audit that claims complete coverage must fail when it is incomplete.
+  // These used to be a printed NOTE, which is indistinguishable from success in
+  // an exit code.
+  if (skipped.length > 0) {
+    rangeFailures.push(`${skipped.length} date(s) could not be seeded: ${skipped[0]} .. ${skipped.at(-1)}`);
+  }
+  if (unresolved.length > 0) {
+    rangeFailures.push(
+      `${unresolved.length} row(s) select an actionable date outside the audited range ` +
+        `(${unresolved.map((r) => `${r.date}->${r.selectedActionableDate}`).join(', ')})`,
+    );
+  }
+  const uniqueDates = new Set(rows.map((r) => r.date));
+  if (uniqueDates.size !== rows.length) rangeFailures.push('duplicate dates in the audited rows');
+  for (const [index, row] of rows.entries()) {
+    if (index > 0 && row.date !== addDaysToIsoDate(rows[index - 1]!.date, 1)) {
+      rangeFailures.push(`gap before ${row.date}`);
+    }
+  }
+} else if (skipped.length > 0 || unresolved.length > 0) {
   console.log(
-    `NOTE: ${unresolved.length} row(s) select an actionable date outside the audited range ` +
-      `(${unresolved.map((r) => `${r.date}->${r.selectedActionableDate}`).join(', ')}), so their ` +
-      `count could not be taken from a seeded run.`,
+    `--allow-partial-range: ${skipped.length} skipped date(s), ${unresolved.length} unresolved ` +
+      'actionable row(s). This run is PARTIAL evidence.',
   );
 }
 
 const bad = rows.filter((r) => r.problems.length > 0);
 console.log(
   `\n${rows.length} dates seeded in ${elapsed}s — ${bad.length} mismatch(es); ` +
-    `${skipped.length} date(s) not seedable against a live database`,
+    `${skipped.length} date(s) not seedable against a live database; ` +
+    `${weekdayFailures.length} weekday map disagreement(s); ` +
+    `${rangeFailures.length} range failure(s)`,
 );
+for (const failure of [...weekdayFailures, ...rangeFailures]) console.log(`  FAIL ${failure}`);
+if (weekdayFailures.length > 0 || rangeFailures.length > 0) process.exitCode = 1;
 if (bad.length > 0) {
   for (const row of bad) console.log(`  ${row.date}: ${row.problems.join('; ')}`);
   process.exitCode = 1;
 }
 console.log(
   JSON.stringify(
-    { from, to, earliestSeedable, skipped, elapsedSeconds: Number(elapsed), rows },
+    {
+      from,
+      to,
+      earliestSeedable,
+      skipped,
+      elapsedSeconds: Number(elapsed),
+      canonicalByWeekday,
+      weekdayFailures,
+      rangeFailures,
+      rows,
+    },
     null,
     0,
   ),
