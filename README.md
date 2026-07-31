@@ -39,6 +39,8 @@ npm install
 cp .env.example .env                      # then edit values
 npm run db:migrate
 SEED_CONFIRM=wipe npm run db:seed         # fictional data; TRUNCATEs everything.
+# Seeds around today by default. Tests pass SEED_REFERENCE_DATE=YYYY-MM-DD so
+# the dataset is a function of a stated day, not of the day they happen to run.
 # Three interlocks: refuses NODE_ENV=production, refuses databases not named
 # *_dev/_development/_local/_test, and refuses to run without SEED_CONFIRM=wipe.
 
@@ -61,6 +63,61 @@ Seed logins (password for all: `FootRepose!Dev1` — dev only):
 
 All seeded people are fictional. Never put real customer or employee data
 in seeds or fixtures.
+
+### What the seed produces, and why it varies
+
+The seed builds three Muscat days around a **reference date** —
+`SEED_REFERENCE_DATE`, defaulting to today. How many bookings fit is a function
+of that date's weekday, and the totals are exact:
+
+| reference weekday | bookings |
+| ----------------- | -------- |
+| Sunday–Wednesday  |      161 |
+| Thursday          |      121 |
+| Friday            |       95 |
+| Saturday          |      106 |
+
+Two deliberate facts explain the whole spread, and `packages/db/src/seed-plan.ts`
+encodes them so a test can derive the number instead of guessing a threshold:
+
+- **Friday is the weekly day off.** Every roster omits it, so no provider is
+  present at their home branch and a Friday reference date seeds **zero**
+  bookings company-wide — not "fewer". A Friday appearing as the reference day,
+  as yesterday, or as tomorrow removes that day's entire contribution.
+- **Al Khuwair is closed tomorrow.** The seed writes a closure override for the
+  first branch on the day after the reference date, so tomorrow contributes ten
+  branches rather than eleven.
+
+Live-database tests never pin a date: they derive one from `futureWeekAnchor()`,
+the first Sunday at least two days ahead, and take a full Sunday-to-Saturday
+week from it. A pinned date is seedable when it is written and forbidden once
+the calendar passes it, so it would turn CI red on its own — the same
+expiring-test defect in slower motion. Pure date-contract tests still use fixed
+historical, month-boundary and leap dates, because they write no rows.
+
+**A reference date before yesterday cannot be seeded at all.** Migration 0005
+refuses a branch-hours override for a past Muscat date ("past days are
+history"), and the seed writes one for `reference + 1`. So a live-database audit
+can only cover today − 1 forward, whatever day it runs. Full multi-month
+coverage therefore lives in `packages/db/tests/seed-plan.test.ts`, which is pure
+and exhaustive over 62 consecutive dates; `packages/db/src/seed-audit.ts` runs
+the same assertions against real rows, over a FUTURE range so all 62 are
+seedable, against a database it REFUSES to share — `SEED_AUDIT_DATABASE_URL`
+must be set and must differ from `DATABASE_URL` and `TEST_DATABASE_URL`, checked
+before anything is wiped. It audits every provider allocation including released
+ones (cancelled and no-show bookings release their claims, and the old
+`released_at IS NULL` filter silently skipped them), and records real per-branch
+counts. It reports four separate eligibility counters — outside branch
+availability, outside provider presence, no branch assignment, no service
+qualification — computed with the application's own `materializeBranchHours` /
+`materializeProviderPresence`, not a weekday-only SQL approximation.
+
+This used to be undocumented, and the tests asserted `bookings > 100` and "Al
+Khuwair has something to check in today". Both are true most of the week and
+false on the day off, so the suite went red on a Friday with nothing changed.
+The invariants now assert the derived count, a seven-day matrix exercises every
+weekday on demand, and Playwright's `globalSetup` seeds an explicitly actionable
+reference date and the spec navigates to it through the real next-day button.
 
 ## Vertical slice 1 (this repo state)
 

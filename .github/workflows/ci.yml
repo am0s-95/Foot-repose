@@ -80,7 +80,9 @@ jobs:
             echo "::error::expected PostgreSQL 16.13 (160013), got $num"; exit 1; }
       - run: npm ci
       - run: npm run db:migrate
-      - run: npm run db:seed
+      # No seed step: Playwright's globalSetup seeds for an explicit Muscat
+      # reference date. A seed here would race it and would reintroduce the
+      # dependency on whatever weekday CI happens to run.
       - run: npx playwright install --with-deps chromium
       - run: npm run build -w @foot-repose/api -w @foot-repose/branch-app -w @foot-repose/customer-app
       - run: npm run test:e2e
