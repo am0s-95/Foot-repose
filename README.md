@@ -533,6 +533,27 @@ integrity boundary and no invalid claim is ever written. What reaches the caller
 in that case is a `P0001` trigger error with no stable constraint identifier, so
 it is **not** classified; its message is never parsed.
 
+### Test-database safety
+
+`npm test` must never be able to destroy a database it did not create. It once
+could: a test opened a hardcoded `127.0.0.1:5432/postgres` connection —
+ignoring `TEST_DATABASE_URL` — and ran `DROP DATABASE IF EXISTS foot_repose_prod`
+before its first assertion, so a real database of that name on the local cluster
+was deleted, OID and all.
+
+Tests that need a second database now go through
+`apps/api/tests/scratch-database.ts`: every URL is derived from the configured
+`DATABASE_URL`, the admin connection must itself be a `_test` database (checked
+live with `current_database()`), names are random and never fixed,
+`CREATE DATABASE` carries no `IF NOT EXISTS` so a collision fails instead of
+consuming a database, and `DROP DATABASE` carries no `IF EXISTS` and runs only
+for a database the helper proved it created. The worst case if a run is killed
+is one orphaned, uniquely named scratch database.
+
+The `checks` CI job deliberately publishes PostgreSQL on host port **55432**, so
+any future code that assumes `5432` fails the job instead of finding somebody
+else's cluster.
+
 ## Checks
 
 ```bash
