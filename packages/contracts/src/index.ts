@@ -139,6 +139,11 @@ export const API_ERROR_CODES = [
   'invalid_transition',
   'conflict',
   'rate_limited',
+  // [T3] The request body exceeded the server's byte ceiling. Deliberately NOT
+  // `validation_error`: that says the content was wrong, which invites a client
+  // to fix the fields and retry. This says the request was too big to be read
+  // at all, and it is decided before any field is looked at.
+  'payload_too_large',
   'internal_error',
 ] as const;
 export type ApiErrorCode = (typeof API_ERROR_CODES)[number];

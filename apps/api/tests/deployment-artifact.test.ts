@@ -1,4 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { Agent, request as httpRequest } from 'node:http';
 import { cpSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -115,5 +116,153 @@ describe('[F1g] the deployment artifact carries what the password worker needs',
     const profile = (await response.json()) as { employee: { email: string } };
     expect(profile.employee.email).toBe('staff.a@test.example');
     expect(serverLog).not.toContain("Cannot find module 'bcryptjs'");
+  }, 60_000);
+});
+
+/**
+ * [T3] The byte ceiling, over real sockets, on the artifact that ships.
+ *
+ * The helper tests prove the counting. These prove what a real client actually
+ * experiences — including the two framings a caller chooses between, which the
+ * application never sees directly.
+ *
+ * Measured on pre-fix main 02494832 against this same artifact: a 2 MiB login
+ * answered 401 in 245ms with a declared length and 121ms chunked, meaning the
+ * body was read and the password was verified; and a 2 MiB authenticated
+ * transition answered 200 and moved the booking.
+ */
+describe('[T3] oversized bodies are refused by the deployed artifact', () => {
+  const oversized = (fillerBytes: number): string =>
+    JSON.stringify({
+      email: 'staff.a@test.example',
+      // A REAL password: a 413 that still authenticated would be a silent success.
+      password: TEST_PASSWORD,
+      filler: 'A'.repeat(fillerBytes),
+    });
+
+  /** Two megabytes: proves nothing of that size is ever buffered. */
+  const HUGE = oversized(2 * 1024 * 1024);
+  /**
+   * Comfortably over the 16 KiB ceiling, and small enough to leave the client
+   * in one write.
+   *
+   * MEASURED: with a 2 MiB chunked body the client is still uploading when the
+   * server answers 413 and closes, so under load it observes EPIPE instead of
+   * the response. That is legitimate server behaviour — see the reuse test
+   * below — but it makes the assertion about the STATUS a race. A body that
+   * flushes in one go removes the race without weakening the claim: it still
+   * carries no Content-Length, and it is still over the limit.
+   */
+  const OVER_LIMIT_CHUNKED = oversized(40_000);
+
+  interface Sent {
+    status?: number;
+    body: string;
+    setCookie?: string[];
+    error?: string;
+    ms: number;
+  }
+
+  /** One request, framed either by a declared length or as chunked. */
+  const send = (
+    body: string,
+    options: { chunked?: boolean; agent?: Agent | false } = {},
+  ): Promise<Sent> =>
+    new Promise((resolve) => {
+      const buffer = Buffer.from(body, 'utf8');
+      const headers: Record<string, string> = { 'content-type': 'application/json' };
+      if (options.chunked) headers['transfer-encoding'] = 'chunked';
+      else headers['content-length'] = String(buffer.length);
+      const started = Date.now();
+
+      const req = httpRequest(
+        {
+          host: '127.0.0.1',
+          port: PORT,
+          path: '/api/auth/login',
+          method: 'POST',
+          headers,
+          agent: options.agent ?? false,
+        },
+        (res) => {
+          let text = '';
+          res.on('data', (chunk: Buffer) => (text += chunk.toString()));
+          res.on('end', () =>
+            resolve({
+              status: res.statusCode,
+              body: text,
+              setCookie: res.headers['set-cookie'],
+              ms: Date.now() - started,
+            }),
+          );
+        },
+      );
+      req.on('error', (error: NodeJS.ErrnoException) =>
+        resolve({ error: error.code ?? error.message, body: '', ms: Date.now() - started }),
+      );
+      if (options.chunked) {
+        for (let i = 0; i < buffer.length; i += 64 * 1024) {
+          req.write(buffer.subarray(i, i + 64 * 1024));
+        }
+        req.end();
+      } else {
+        req.end(buffer);
+      }
+    });
+
+  const expectRefused = (sent: Sent): void => {
+    expect(sent.status).toBe(413);
+    expect(JSON.parse(sent.body)).toEqual({
+      error: { code: 'payload_too_large', message: 'Request body too large' },
+    });
+    // The valid credentials inside were never acted on.
+    expect(sent.setCookie).toBeUndefined();
+    expect(sent.body).not.toContain('AAAA');
+    expect(sent.body).not.toContain(TEST_PASSWORD);
+  };
+
+  it('refuses a body with a declared Content-Length', async () => {
+    expectRefused(await send(HUGE));
+  }, 60_000);
+
+  it('refuses a chunked body that declares no length at all', async () => {
+    // The case a Content-Length check alone cannot cover: the caller never says
+    // how much is coming.
+    expectRefused(await send(OVER_LIMIT_CHUNKED, { chunked: true }));
+  }, 60_000);
+
+  it('keeps a declared-length connection reusable across the rejection', async () => {
+    const pool = new Agent({ keepAlive: true, maxSockets: 1 });
+    try {
+      expect((await send(JSON.stringify({ email: 'a@b.test', password: 'x' }), { agent: pool })).status)
+        .toBe(401);
+      expectRefused(await send(HUGE, { agent: pool }));
+      // Same pooled socket, and the following request is answered correctly
+      // rather than misparsed as a continuation of the rejected body.
+      expect((await send(JSON.stringify({ email: 'a@b.test', password: 'x' }), { agent: pool })).status)
+        .toBe(401);
+    } finally {
+      pool.destroy();
+    }
+  }, 60_000);
+
+  it('serves the next request normally after a chunked rejection', async () => {
+    // MEASURED with a 2 MiB chunked body: the server closes that connection,
+    // because the client was still uploading into a request it had stopped
+    // reading, and a client reusing that pooled socket sees a reset ~6s later.
+    // Closing is the documented, acceptable outcome — hanging, crashing or
+    // misparsing the next request is not. Whichever way the rejected connection
+    // ends, a fresh one is immediately serviceable, which is what this asserts.
+    expectRefused(await send(OVER_LIMIT_CHUNKED, { chunked: true }));
+    const next = await send(JSON.stringify({ email: 'staff.a@test.example', password: TEST_PASSWORD }));
+    expect(next.status).toBe(200);
+    expect((next.setCookie ?? []).join(';')).toContain('fr_wf_session=');
+  }, 60_000);
+
+  it('leaves the artifact healthy and logs no payload', async () => {
+    const health = await fetch(`${BASE}/api/health`);
+    expect(health.status).toBe(200);
+    expect(serverLog).not.toContain('AAAA');
+    expect(serverLog).not.toContain(TEST_PASSWORD);
   }, 60_000);
 });

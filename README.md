@@ -304,6 +304,24 @@ future customer realm):
   leaves `sessions.ip` and `audit_logs.ip` null.
 - State-changing routes enforce an **Origin allowlist** (`ALLOWED_ORIGINS`).
 - Actor-scoped responses ship `cache-control: private, no-store`.
+- **JSON request bodies are bounded at 16 KiB** (16,384 raw bytes), measured
+  before parsing. Measured on pre-fix `main` `02494832` against the deployed
+  artifact: a 2 MiB login body answered `401` — the password had been verified —
+  with a declared `Content-Length` and as chunked alike, and a 2 MiB
+  authenticated transition answered `200` and actually moved the booking. There
+  was no application-level ceiling at all. `Content-Length` is now used only to
+  refuse early; it is a caller's claim, and a chunked request makes none, so the
+  enforcement is a running byte count over the body stream that stops before the
+  overflowing chunk is retained and cancels the source. Over the limit answers
+  `413` `payload_too_large` — a distinct code from `validation_error`, because
+  size is decided before any field is read — with the usual
+  `private, no-store` envelope and nothing of the body echoed back. The ceiling
+  is a fixed constant, not an environment variable: the largest legitimate
+  request here is a login with a 320-character email and a 200-character
+  password, and a deployment must not be able to quietly raise a security
+  bound. It also sits *after* Origin, session and routing checks, so an
+  unauthorized oversized request still answers 403/401/404 rather than
+  disclosing that it got as far as being measured.
 - `AUTH_SECRET` must be ≥ 32 chars; the `change-me` placeholder is
   rejected at startup.
 
