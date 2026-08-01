@@ -236,13 +236,60 @@ future customer realm):
   must be a bare origin — missing or malformed answers `503`, an unreachable
   upstream `502`, both as the API's structured JSON error with
   `cache-control: private, no-store` and no URL, DNS error or stack in the body.
-  A hung upstream is **not** addressed: there is no outbound timeout here, so
-  this does not solve F10. The evidence builds the artifact **once with a poison
+  A hung upstream **is** now addressed — see the outbound deadline below; that
+  closes this hop only, and is not a claim about F10 elsewhere in the system.
+  The evidence builds the artifact **once with a poison
   destination**, runs it from outside the repository against two different
   upstreams, and hashes the tree around the runs. The customer app is a
   different case, and is tested as such rather than assumed: its `API_URL` read
   is in a `force-dynamic` Server Component, so it is already a runtime read —
   its silent `http://localhost:3000` fallback remains, deliberately untouched.
+- The branch gateway holds an **outbound deadline** (`API_UPSTREAM_TIMEOUT_MS`,
+  default `15000`, accepted `100`–`120000`), read at run time per request like
+  the destination. Without it the gateway could wait forever, and measured on
+  the pre-fix standalone artifact it did — in **three** distinct places, each
+  reproduced against a real upstream over real sockets: an upstream that accepts
+  the request and never sends response headers (the wait is inside `fetch()`);
+  one that sends valid headers and then stalls mid-body (`fetch()` has already
+  resolved, so the wait is inside `response.arrayBuffer()`); and a streamed
+  request body sent to an upstream that stops consuming it. All three left the
+  branch request pending with no response byte produced. One `AbortController`
+  carries the deadline across all three phases, because a per-phase timeout
+  leaves their sum unbounded — and it is an **abort**, not a `Promise.race`,
+  because racing only stops this handler waiting while the upstream request
+  stays open, still holding a socket. The timer is released only after the body
+  has been read, not when the headers arrived. An expired request answers `504`
+  with `API request timed out`; that stays distinct from the `502` of an
+  unreachable or broken upstream, because 504 means the gateway decided to stop
+  waiting and points the operator at this variable rather than at the API. An
+  upstream's **own** 504 is relayed untouched and never synthesised here.
+  Nothing is retried on expiry. A malformed value fails closed with the same
+  `503` as a malformed `API_URL` — digits only, so `1e3`, `0x1F4`, `2000ms`,
+  `-1` and `1.5` are refused rather than coerced, since a deployment that asked
+  for `2000` and silently got `15000` is indistinguishable from one that asked
+  for nothing. The evidence runs the **same artifact** at two different
+  deadlines and hashes the tree around both runs.
+- The same abort has a **second owner: the caller**. A deadline-only version of
+  this shipped first and was incomplete — the timer was the only thing that
+  could abort the upstream, so an employee closing a tab left the upload, the
+  headers wait or the body read running against the API for the rest of the
+  deadline, fifteen seconds per abandoned request by default. The incoming
+  `req.signal` now aborts the same controller, and a request that arrives
+  already cancelled starts no upstream request at all — which matters most for
+  a non-GET, where forwarding one would perform a booking transition on behalf
+  of a caller that had gone. Both causes are recorded, because
+  `AbortSignal.aborted` says only THAT something aborted, never by whom: the
+  first cause wins and is never relabelled, so a timer firing just after a
+  disconnect cannot report it as an API timeout, and a disconnect just after
+  the deadline cannot retract a 504 the caller is owed. A cancelled caller gets
+  no invented status and no upstream-failure log line — there is nobody left to
+  answer, and logging it would fill the operator's log with errors every time
+  someone closes a tab. Every controller, flag and listener is per request, and
+  the listener is removed with the timer on every exit path. Measured against
+  the deadline-only commit: cancelling before response headers, and cancelling
+  during a stalled body, both left the upstream connection open until the
+  deadline expired; cancelling mid-upload already tore it down, incidentally,
+  because the incoming body stream *is* the outgoing one.
 - The branch gateway is a new hop in front of the API, so the **F1** boundary is
   re-proven through it: `x-forwarded-for`, `forwarded`, `x-real-ip`,
   `cf-connecting-ip`, `true-client-ip`, `x-client-ip`, `x-forwarded-host`,

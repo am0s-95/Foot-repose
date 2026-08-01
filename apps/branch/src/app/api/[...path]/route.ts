@@ -1,4 +1,9 @@
-import { resolveTarget, resolveUpstream, UpstreamConfigError } from '../../../lib/upstream';
+import {
+  resolveTarget,
+  resolveTimeoutMs,
+  resolveUpstream,
+  UpstreamConfigError,
+} from '../../../lib/upstream';
 
 /**
  * [F29] The Branch app's API gateway.
@@ -91,6 +96,17 @@ const GATEWAY_MISCONFIGURED = 503;
 const UPSTREAM_UNAVAILABLE = 502;
 
 /**
+ * [T2] The gateway's own deadline expired.
+ *
+ * Kept distinct from 502 on purpose. A refused connection or a broken body is
+ * the upstream having failed; this is the gateway having decided to stop
+ * waiting, and it is the one status where an operator should look at
+ * `API_UPSTREAM_TIMEOUT_MS` rather than at the API. An upstream's OWN 504 is
+ * relayed as-is and never synthesised here — see `forward`.
+ */
+const GATEWAY_DEADLINE_EXCEEDED = 504;
+
+/**
  * The API's error contract, reused so a gateway failure is the same shape the
  * client already parses. The messages are constants: the configured URL, the
  * DNS or connect error and the stack stay on this side of the wire.
@@ -100,6 +116,31 @@ function gatewayError(status: number, message: string): Response {
     status,
     headers: { 'content-type': 'application/json', 'cache-control': 'private, no-store' },
   });
+}
+
+/**
+ * [T2] Who ended the upstream request.
+ *
+ * The two causes need different answers, so the reason has to be recorded
+ * rather than inferred: `AbortSignal.aborted` says THAT the request was
+ * aborted, never BY WHOM, and once there are two possible aborters that is no
+ * longer enough to classify the failure.
+ */
+type AbortSource = 'deadline' | 'client';
+
+/**
+ * The caller is gone, so there is nobody to answer.
+ *
+ * Thrown rather than returned: inventing a 502/503/504 here would mean
+ * fabricating a public error contract for a browser that has already
+ * disconnected, and logging it as an upstream failure would put a permanent
+ * error in the operator's log every time an employee closes a tab. An
+ * `AbortError` is what the runtime already understands as "this request ended
+ * with its caller".
+ */
+function callerGone(reason: unknown): Error {
+  if (reason instanceof Error) return reason;
+  return new DOMException('The incoming request was cancelled by its caller.', 'AbortError');
 }
 
 function badRequest(message: string): Response {
@@ -145,8 +186,10 @@ function inboundHeaders(upstream: Response): Headers {
 
 async function forward(req: Request): Promise<Response> {
   let upstream: URL;
+  let deadlineMs: number;
   try {
     upstream = resolveUpstream();
+    deadlineMs = resolveTimeoutMs();
   } catch (error) {
     if (error instanceof UpstreamConfigError) {
       // The reason names the rule, not the value — safe to log, useless to leak.
@@ -160,6 +203,12 @@ async function forward(req: Request): Promise<Response> {
   const target = resolveTarget(incoming.pathname, incoming.search, upstream);
   if (target === null) return badRequest('Unsupported API path');
 
+  // [T2] A caller that has ALREADY gone gets no upstream request at all. Not an
+  // optimisation: without it the gateway opens a connection, sends a body and
+  // occupies one of the API's slots on behalf of nobody, and for a non-GET that
+  // is a booking transition performed for a request its caller abandoned.
+  if (req.signal.aborted) throw callerGone(req.signal.reason);
+
   // STREAMED, not buffered. Reading the body first would hold an entire
   // attacker-chosen payload in this process before the upstream — which has the
   // body limits — ever sees a byte, and this gateway is reachable
@@ -169,46 +218,116 @@ async function forward(req: Request): Promise<Response> {
   // send, and an absent body stays absent.
   const body = req.method === 'GET' || req.method === 'HEAD' ? undefined : (req.body ?? undefined);
 
-  let response: Response;
-  try {
-    response = await fetch(target, {
-      method: req.method,
-      headers: outboundHeaders(req),
-      body,
-      duplex: 'half',
-      redirect: 'manual',
-      // Nothing here is cacheable, and no retry: a repeated POST is a second
-      // booking transition, not a retry.
-      cache: 'no-store',
-    } as RequestInit & { duplex: 'half' });
-  } catch (error) {
-    console.error('[gateway] upstream request failed:', error);
-    return gatewayError(UPSTREAM_UNAVAILABLE, 'API is unavailable');
-  }
+  // [T2] ONE deadline for the whole exchange, not one per phase.
+  //
+  // The pre-fix code had no bound anywhere, and it could stall in three
+  // distinct places: waiting for response headers, waiting for the rest of a
+  // body whose headers had already arrived, and streaming a request body to an
+  // upstream that had stopped consuming it. All three were measured pending on
+  // the deployed artifact before this existed.
+  //
+  // A per-phase timeout would leave the sum unbounded, and `Promise.race`
+  // alone would only stop this handler WAITING — the upstream request would
+  // still be open, still holding a socket and still delivering into a body
+  // nobody reads. Aborting the signal is what actually ends the upstream work,
+  // so that is what carries the deadline. The same signal covers all three
+  // phases because it is attached to the fetch: it aborts the outgoing body
+  // stream, the headers wait, and the response body stream alike.
+  //
+  // TWO things can end it, and they are not interchangeable. The deadline is
+  // the gateway giving up on the API and owes the caller a 504. A caller that
+  // disconnects owes nobody anything — but the upstream work it started must
+  // still stop, or an employee closing a tab leaves a request running against
+  // the API for the rest of the deadline. Both abort the SAME controller, so
+  // the upstream is released either way; only the answer differs.
+  //
+  // Every controller and every flag here is per-request. Nothing is shared, so
+  // one caller's cancellation cannot reach another caller's request.
+  const clock = new AbortController();
+  let abortedBy: AbortSource | null = null;
 
-  // 204 and 304 are defined to carry no body; handing one to `Response` throws.
-  const bodyless = response.status === 204 || response.status === 304;
-  let payload: ArrayBuffer | null = null;
-  if (!bodyless) {
+  // First cause wins and is never overwritten: a timer that fires just after a
+  // disconnect must not relabel it a timeout, and a disconnect just after the
+  // deadline must not erase a 504 the caller is owed. Re-aborting an already
+  // aborted controller is a no-op, so the ordering is decided here alone.
+  const claim = (source: AbortSource): void => {
+    abortedBy ??= source;
+    clock.abort();
+  };
+
+  const expiry = setTimeout(() => claim('deadline'), deadlineMs);
+  const onCallerGone = (): void => claim('client');
+  req.signal.addEventListener('abort', onCallerGone, { once: true });
+
+  try {
+    let response: Response;
     try {
-      payload = await response.arrayBuffer();
+      response = await fetch(target, {
+        method: req.method,
+        headers: outboundHeaders(req),
+        body,
+        duplex: 'half',
+        redirect: 'manual',
+        // Nothing here is cacheable, and no retry: a repeated POST is a second
+        // booking transition, not a retry. That is unchanged by the deadline —
+        // an expired request is answered, never re-sent.
+        cache: 'no-store',
+        signal: clock.signal,
+      } as RequestInit & { duplex: 'half' });
     } catch (error) {
-      // `fetch` resolved as soon as the status and headers arrived, so an
-      // upstream that then resets the connection, under-delivers against its own
-      // Content-Length, or sends a malformed compressed body fails HERE — after
-      // the guard above. Left unguarded this rejected out of the handler and
-      // Next answered an unstructured HTML 500. It is the same upstream failure
-      // as a refused connection and gets the same answer.
-      console.error('[gateway] upstream response body failed:', error);
+      // `clock.signal.aborted` is deliberately NOT the test: it is true for
+      // both causes and would report an employee closing a tab as an API
+      // timeout. The recorded source is the only thing that distinguishes them.
+      if (abortedBy === 'client') throw callerGone(req.signal.reason);
+      if (abortedBy === 'deadline') {
+        console.error(`[gateway] upstream deadline of ${deadlineMs}ms exceeded before headers`);
+        return gatewayError(GATEWAY_DEADLINE_EXCEEDED, 'API request timed out');
+      }
+      console.error('[gateway] upstream request failed:', error);
       return gatewayError(UPSTREAM_UNAVAILABLE, 'API is unavailable');
     }
-  }
 
-  return new Response(payload, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: inboundHeaders(response),
-  });
+    // 204 and 304 are defined to carry no body; handing one to `Response` throws.
+    const bodyless = response.status === 204 || response.status === 304;
+    let payload: ArrayBuffer | null = null;
+    if (!bodyless) {
+      try {
+        payload = await response.arrayBuffer();
+      } catch (error) {
+        // `fetch` resolved as soon as the status and headers arrived, so an
+        // upstream that then resets the connection, under-delivers against its own
+        // Content-Length, or sends a malformed compressed body fails HERE — after
+        // the guard above. Left unguarded this rejected out of the handler and
+        // Next answered an unstructured HTML 500. It is the same upstream failure
+        // as a refused connection and gets the same answer.
+        //
+        // The deadline reaches this phase too, and it is the phase that most
+        // needed it: an upstream that sends valid headers and then stalls kept
+        // this read open with the status already decided.
+        if (abortedBy === 'client') throw callerGone(req.signal.reason);
+        if (abortedBy === 'deadline') {
+          console.error(`[gateway] upstream deadline of ${deadlineMs}ms exceeded reading body`);
+          return gatewayError(GATEWAY_DEADLINE_EXCEEDED, 'API request timed out');
+        }
+        console.error('[gateway] upstream response body failed:', error);
+        return gatewayError(UPSTREAM_UNAVAILABLE, 'API is unavailable');
+      }
+    }
+
+    return new Response(payload, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: inboundHeaders(response),
+    });
+  } finally {
+    // Every exit runs this: success, 502, deadline 504, caller cancellation and
+    // a failed body read alike. The deadline covers the complete exchange, so
+    // it is only released once the body has been read — not when the headers
+    // arrived — and the listener goes with it so a long-lived incoming signal
+    // cannot accumulate handlers from finished requests.
+    clearTimeout(expiry);
+    req.signal.removeEventListener('abort', onCallerGone);
+  }
 }
 
 export const GET = forward;

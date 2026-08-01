@@ -1,8 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_TIMEOUT_MS,
+  MAX_TIMEOUT_MS,
+  MIN_TIMEOUT_MS,
   rejectUnsafePath,
   resolveTarget,
+  resolveTimeoutMs,
   resolveUpstream,
+  TIMEOUT_VAR,
   UPSTREAM_VAR,
   UpstreamConfigError,
 } from '../src/lib/upstream';
@@ -106,6 +111,82 @@ describe('[F29-F] the request path cannot escape the configured upstream', () =>
     for (const pathname of ['/api/x', '/api/a/b/c', '/api/%20', "/api/a'b", '/api/:x@y']) {
       const target = resolveTarget(pathname, '', upstream);
       if (target !== null) expect(target.origin).toBe(upstream.origin);
+    }
+  });
+});
+
+/**
+ * [T2] The outbound deadline, at the unit where its rules are decided.
+ *
+ * The end-to-end tests prove a stalled upstream is actually cut off on the
+ * deployed artifact. These prove WHICH values the gateway will run with at all,
+ * cheaply enough to enumerate the edges — including the ones `Number()` would
+ * have accepted silently.
+ */
+const withTimeout = (value: string | undefined): Record<string, string | undefined> =>
+  value === undefined ? {} : { [TIMEOUT_VAR]: value };
+
+describe('[T2] the outbound deadline is configured at runtime', () => {
+  it('defaults to a bounded wait rather than to no bound', () => {
+    // The distinction from API_URL: an absent destination has no safe guess, an
+    // absent deadline does. Waiting forever is never what anyone configured.
+    expect(resolveTimeoutMs(withTimeout(undefined))).toBe(DEFAULT_TIMEOUT_MS);
+    expect(resolveTimeoutMs(withTimeout(''))).toBe(DEFAULT_TIMEOUT_MS);
+    expect(resolveTimeoutMs(withTimeout('   '))).toBe(DEFAULT_TIMEOUT_MS);
+    expect(DEFAULT_TIMEOUT_MS).toBe(15_000);
+  });
+
+  it('accepts the documented range, both ends included', () => {
+    expect(resolveTimeoutMs(withTimeout(String(MIN_TIMEOUT_MS)))).toBe(MIN_TIMEOUT_MS);
+    expect(resolveTimeoutMs(withTimeout(String(MAX_TIMEOUT_MS)))).toBe(MAX_TIMEOUT_MS);
+    expect(resolveTimeoutMs(withTimeout('2000'))).toBe(2000);
+    expect([MIN_TIMEOUT_MS, MAX_TIMEOUT_MS]).toEqual([100, 120_000]);
+  });
+
+  it.each([
+    [String(MIN_TIMEOUT_MS - 1), 'below the floor'],
+    ['0', 'zero would make every request a 504'],
+    [String(MAX_TIMEOUT_MS + 1), 'above the ceiling'],
+    ['999999999', 'far above the ceiling'],
+  ])('refuses %s (%s)', (value) => {
+    expect(() => resolveTimeoutMs(withTimeout(value))).toThrow(UpstreamConfigError);
+    expect(() => resolveTimeoutMs(withTimeout(value))).toThrow('must be between');
+  });
+
+  it.each([
+    ['abc', 'not a number at all'],
+    ['-1', 'negative'],
+    ['-5000', 'negative in range if the sign were dropped'],
+    ['1.5', 'fractional'],
+    ['2000.0', 'fractional spelling of an accepted value'],
+    // Every one of these is a value `Number()` accepts and an operator did not
+    // knowingly write. '1e3' and '0x1F4' both land inside the range.
+    ['1e3', 'exponent notation'],
+    ['0x1F4', 'hexadecimal'],
+    ['2_000', 'numeric separator'],
+    ['2000ms', 'unit suffix'],
+    ['Infinity', 'literally unbounded'],
+    ['NaN', 'not a number'],
+  ])('refuses %s (%s) rather than coercing it', (value) => {
+    expect(() => resolveTimeoutMs(withTimeout(value))).toThrow(UpstreamConfigError);
+  });
+
+  it('fails closed on a typo instead of silently using the default', () => {
+    // A deployment that asked for 2000 and got 15000 must not be
+    // indistinguishable from one that asked for nothing.
+    expect(() => resolveTimeoutMs(withTimeout('2ooo'))).toThrow(UpstreamConfigError);
+    expect(resolveTimeoutMs(withTimeout('2000'))).not.toBe(DEFAULT_TIMEOUT_MS);
+  });
+
+  it('never puts the configured value into the failure reason', () => {
+    // Same rule as the destination: this reason reaches logs.
+    try {
+      resolveTimeoutMs(withTimeout('99999999'));
+      throw new Error('expected a rejection');
+    } catch (error) {
+      expect(error).toBeInstanceOf(UpstreamConfigError);
+      expect((error as Error).message).not.toContain('99999999');
+      expect((error as Error).message).toContain(TIMEOUT_VAR);
     }
   });
 });

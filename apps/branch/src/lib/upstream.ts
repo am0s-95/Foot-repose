@@ -78,6 +78,68 @@ export function resolveUpstream(env: Record<string, string | undefined> = proces
 }
 
 /**
+ * [T2] How long the gateway will wait on the upstream, decided at RUNTIME.
+ *
+ * Read per request for the same reason the destination is (see above): an
+ * artifact that is promoted between environments must be able to carry a
+ * different deadline without being rebuilt.
+ */
+export const TIMEOUT_VAR = 'API_UPSTREAM_TIMEOUT_MS';
+
+/**
+ * Unlike `API_URL` this HAS a default, and the difference is deliberate. A
+ * missing destination has no safe assumption behind it — any guess sends real
+ * traffic somewhere unintended. A missing deadline does: waiting forever is
+ * never what an operator meant, so the absent case fails to a bounded value
+ * rather than to no bound at all.
+ */
+export const DEFAULT_TIMEOUT_MS = 15_000;
+
+/**
+ * The accepted range. Both ends are refusals of a value that would defeat the
+ * point: below the floor no real upstream can answer, so the gateway would be
+ * a generator of 504s; above the ceiling the deadline is longer than any
+ * caller, proxy or load balancer in front of it will wait, so it stops being a
+ * deadline and becomes the unbounded wait this exists to remove.
+ */
+export const MIN_TIMEOUT_MS = 100;
+export const MAX_TIMEOUT_MS = 120_000;
+
+/**
+ * The configured deadline in milliseconds, or a thrown `UpstreamConfigError`.
+ *
+ * A malformed deadline fails closed exactly as a malformed destination does.
+ * Silently falling back to the default on a typo would mean a deployment that
+ * asked for 2000 and got 15000 looks identical to one that asked for nothing,
+ * and the operator never learns which they are running.
+ *
+ * As with `resolveUpstream`, the reason names the RULE and never the value.
+ */
+export function resolveTimeoutMs(env: Record<string, string | undefined> = process.env): number {
+  const raw = env[TIMEOUT_VAR]?.trim();
+  if (!raw) return DEFAULT_TIMEOUT_MS;
+
+  // Digits only, checked before Number(). `Number` accepts '1e3', '0x10',
+  // '  12  ', '12.0' and '-1' — every one of those is a configuration the
+  // operator did not knowingly write, and two of them are silently negative or
+  // fractional milliseconds.
+  if (!/^\d+$/.test(raw)) {
+    throw new UpstreamConfigError(`${TIMEOUT_VAR} must be a whole number of milliseconds`);
+  }
+
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value)) {
+    throw new UpstreamConfigError(`${TIMEOUT_VAR} must be a whole number of milliseconds`);
+  }
+  if (value < MIN_TIMEOUT_MS || value > MAX_TIMEOUT_MS) {
+    throw new UpstreamConfigError(
+      `${TIMEOUT_VAR} must be between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS}`,
+    );
+  }
+  return value;
+}
+
+/**
  * The prefix this gateway owns. Everything it forwards starts here, on both
  * sides, so the caller cannot address anything else on the upstream.
  */
