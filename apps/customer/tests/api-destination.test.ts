@@ -1,6 +1,13 @@
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { execFileSync } from 'node:child_process';
+import { type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import {
+  listen,
+  OwnedResources,
+  portIsFree,
+  startNext,
+  withOwnedResources,
+} from './support/owned-resources';
 
 /**
  * [F29-I] Classification, not a fix.
@@ -37,9 +44,17 @@ interface Upstream {
   server: Server;
 }
 
-function startUpstream(marker: string, port: number): Promise<Upstream> {
+/**
+ * Registered with `owned` at the moment it starts listening, so a setup that
+ * fails after this one and before the next still has an owner for it.
+ */
+async function startUpstream(
+  owned: OwnedResources,
+  marker: string,
+  port: number,
+): Promise<Upstream> {
   const seen: string[] = [];
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = await listen(owned, port, (req: IncomingMessage, res: ServerResponse) => {
     seen.push(req.url ?? '');
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(
@@ -48,54 +63,61 @@ function startUpstream(marker: string, port: number): Promise<Upstream> {
       }),
     );
   });
-  return new Promise((resolve) => {
-    server.listen(port, '127.0.0.1', () => resolve({ marker, seen, server }));
-  });
+  return { marker, seen, server };
 }
 
+const owned = new OwnedResources();
 let buildTime: Upstream;
 let runTime: Upstream;
-let app: ChildProcess | null = null;
 let log = '';
 
 beforeAll(async () => {
-  [buildTime, runTime] = await Promise.all([
-    startUpstream('BUILD-TIME-BRANCH', BUILD_PORT),
-    startUpstream('RUNTIME-BRANCH', RUNTIME_PORT),
-  ]);
+  // Every stage registers what it created BEFORE the next one can fail, and a
+  // throw anywhere releases all of it before propagating. The previous version
+  // had no such record: a failure between the upstreams and the app left
+  // whatever had started with nobody responsible for it, and its `afterAll`
+  // could not even close an upstream it had never assigned — `upstream?.server
+  // .close(resolve)` simply never calls `resolve`, so the hook hung instead.
+  await withOwnedResources(owned, async () => {
+    buildTime = await startUpstream(owned, 'BUILD-TIME-BRANCH', BUILD_PORT);
+    runTime = await startUpstream(owned, 'RUNTIME-BRANCH', RUNTIME_PORT);
 
-  execFileSync('npx', ['next', 'build'], {
-    cwd: CUSTOMER_ROOT,
-    stdio: 'pipe',
-    env: { ...process.env, API_URL: `http://127.0.0.1:${BUILD_PORT}` },
-  });
+    execFileSync('npx', ['next', 'build'], {
+      cwd: CUSTOMER_ROOT,
+      stdio: 'pipe',
+      env: { ...process.env, API_URL: `http://127.0.0.1:${BUILD_PORT}` },
+    });
 
-  app = spawn('npx', ['next', 'start', '--port', String(APP_PORT)], {
-    cwd: CUSTOMER_ROOT,
-    env: { ...process.env, NODE_ENV: 'production', API_URL: `http://127.0.0.1:${RUNTIME_PORT}` },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  app.stdout?.on('data', (chunk: Buffer) => (log += chunk.toString()));
-  app.stderr?.on('data', (chunk: Buffer) => (log += chunk.toString()));
+    // A DIRECT child: see `startNext`. `npx next start` put an npm launcher and
+    // a shell between this handle and the server, so killing the handle killed
+    // neither.
+    // The handle is held by `owned`, which is what stops it — there is no
+    // second reference to forget to await.
+    startNext(owned, ['start', '--port', String(APP_PORT)], {
+      cwd: CUSTOMER_ROOT,
+      env: { ...process.env, NODE_ENV: 'production', API_URL: `http://127.0.0.1:${RUNTIME_PORT}` },
+      onLog: (chunk) => (log += chunk),
+    });
 
-  const deadline = Date.now() + 60_000;
-  for (;;) {
-    try {
-      await fetch(`http://127.0.0.1:${APP_PORT}/`);
-      break;
-    } catch {
-      if (Date.now() > deadline) throw new Error(`Customer app never started. Log:\n${log}`);
-      await new Promise((resolve) => setTimeout(resolve, 200));
+    const deadline = Date.now() + 60_000;
+    for (;;) {
+      try {
+        await fetch(`http://127.0.0.1:${APP_PORT}/`);
+        break;
+      } catch {
+        if (Date.now() > deadline) throw new Error(`Customer app never started. Log:\n${log}`);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
     }
-  }
+  });
 }, 900_000);
 
 afterAll(async () => {
-  app?.kill('SIGKILL');
-  await Promise.all(
-    [buildTime, runTime].map((upstream) => new Promise((resolve) => upstream?.server.close(resolve))),
-  );
-});
+  // Awaited, and it throws if anything survived — a cleanup that fails quietly
+  // is what let this suite report success while still serving on :3291.
+  await owned.release();
+  expect(await portIsFree(APP_PORT)).toBe(true);
+}, 60_000);
 
 describe('[F29-I] the Customer app reads its API destination at request time', () => {
   it('fetches from the environment it is RUNNING in, not the one it was BUILT in', async () => {

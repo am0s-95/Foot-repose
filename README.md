@@ -601,6 +601,33 @@ The `checks` CI job deliberately publishes PostgreSQL on host port **55432**, so
 any future code that assumes `5432` fails the job instead of finding somebody
 else's cluster.
 
+### Test-process ownership
+
+A test that starts a server owns it until it is **proven** gone. Measured on
+main `2773b7c`, `apps/customer/tests/api-destination.test.ts` did neither:
+`spawn('npx', ['next', 'start', ...])` produced a three-link chain — the npm
+launcher, a shell, and the real `next-server` — and cleanup was a bare
+`kill('SIGKILL')` on the launcher. The suite exited 0 while port 3291 kept
+serving; GitHub's runner then logged `Terminate orphan process` for the two
+survivors, which is a cleanup contract being false rather than a runner quirk.
+
+Two rules follow, and the tests enforce them:
+
+- **The retained handle must be the process.** Resolve the CLI and run it with
+  `process.execPath`. No `npx`, and nothing spawned through a shell — either one
+  puts a launcher between the handle and the thing that holds the port.
+- **A signal is not an exit.** `stop()` sends SIGTERM, waits for the real `exit`
+  event, escalates once to SIGKILL after a bounded grace period, waits again,
+  and throws if the process is still alive. Cleanup failures are loud; the
+  original silent one is what let the leak survive.
+
+Resources are recorded the moment they exist, so a setup that fails half way
+still releases what it created and then rethrows the *original* failure. The
+release is idempotent, because `afterAll` runs even when `beforeAll` threw —
+measured on this Vitest version, not assumed — and both paths call it. Nothing
+is ever terminated by name: no pattern-based process killing, so a test can
+never reach a server it did not start.
+
 ## Checks
 
 ```bash
