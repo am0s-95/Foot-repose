@@ -1,20 +1,22 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useReducer, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
-  addDaysToIsoDate,
   BOOKING_STATUSES,
   type BookingAction,
   type BookingStatus,
   type EmployeeRole,
 } from '@foot-repose/domain';
 import { ApiError, apiClient } from '@foot-repose/contracts/client';
-import type {
-  BookingDto,
-  BookingsListResponse,
-  EmployeeProfile,
-} from '@foot-repose/contracts';
+import type { BookingDto, EmployeeProfile } from '@foot-repose/contracts';
+import {
+  boardReducer,
+  initialBoardState,
+  requestFor,
+  shownDate as shownDateOf,
+  visibleBoard,
+} from '../lib/board-navigation';
 
 const STATUS_LABELS: Record<BookingStatus, string> = {
   confirmed: 'Confirmed',
@@ -44,16 +46,16 @@ const DESTRUCTIVE_ACTIONS: ReadonlySet<BookingAction> = new Set(['cancel', 'mark
 export default function BoardPage() {
   const router = useRouter();
   const [profile, setProfile] = useState<EmployeeProfile | null>(null);
-  const [branchId, setBranchId] = useState('');
-  /** undefined = "today", resolved by the server in Asia/Muscat. */
-  const [date, setDate] = useState<string | undefined>(undefined);
-  const [statusFilter, setStatusFilter] = useState<BookingStatus | ''>('');
+  /** Navigation intent, request identity and committed response — one machine,
+   * so a click folds on the click before it instead of on the last response. */
+  const [state, dispatch] = useReducer(boardReducer, undefined, () => initialBoardState());
   const [q, setQ] = useState('');
-  const [debouncedQ, setDebouncedQ] = useState('');
-  const [board, setBoard] = useState<BookingsListResponse | null>(null);
-  const [loadingBoard, setLoadingBoard] = useState(true);
-  const [notice, setNotice] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  /** A refused transition, kept apart from the board request's own error so one
+   * cannot silently stand in for the other. */
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const { branchId, statusFilter, generation, targetDate, query, loading, error, authRequired } =
+    state;
 
   const toLogin = useCallback(async (): Promise<void> => {
     // Clear the (stale) cookie first, or the middleware bounces us back.
@@ -68,7 +70,7 @@ export default function BoardPage() {
       .then((me) => {
         if (cancelled) return;
         setProfile(me);
-        setBranchId((current) => current || (me.branches[0]?.id ?? ''));
+        dispatch({ type: 'branch', branchId: me.branches[0]?.id ?? '' });
       })
       .catch(() => {
         if (!cancelled) void toLogin();
@@ -79,42 +81,55 @@ export default function BoardPage() {
   }, [toLogin]);
 
   useEffect(() => {
-    const timer = setTimeout(() => setDebouncedQ(q.trim()), 300);
+    const timer = setTimeout(() => dispatch({ type: 'query', query: q.trim() }), 300);
     return () => clearTimeout(timer);
   }, [q]);
 
-  /** Monotonic sequence so a slow, older response can never overwrite the
-   * result of a newer request (rapid filter/branch/date changes). */
-  const requestSeq = useRef(0);
-
-  const loadBoard = useCallback(async (): Promise<void> => {
-    if (!branchId) return;
-    const seq = ++requestSeq.current;
-    setLoadingBoard(true);
-    try {
-      const data = await apiClient.listBookings(branchId, {
-        date,
-        status: statusFilter || undefined,
-        q: debouncedQ || undefined,
-      });
-      if (seq !== requestSeq.current) return; // stale response — drop it
-      setBoard(data);
-      setNotice(null);
-    } catch (error) {
-      if (seq !== requestSeq.current) return;
-      if (error instanceof ApiError && error.status === 401) {
-        void toLogin();
-        return;
-      }
-      setNotice(error instanceof ApiError ? error.message : 'Failed to load bookings');
-    } finally {
-      if (seq === requestSeq.current) setLoadingBoard(false);
-    }
-  }, [branchId, date, statusFilter, debouncedQ, toLogin]);
-
+  /**
+   * One request per generation. The generation is captured here and quoted back
+   * on the way in, so the reducer — not the order the network happens to answer
+   * in — decides which response is allowed to land. Aborting a superseded
+   * request is a saving, not the guarantee: a response can arrive in the same
+   * instant the abort is signalled, and the generation check still refuses it.
+   */
   useEffect(() => {
-    void loadBoard();
-  }, [loadBoard]);
+    if (!branchId) return undefined;
+    const controller = new AbortController();
+    const params = requestFor(state);
+    apiClient
+      .listBookings(
+        params.branchId,
+        { date: params.date, status: params.status, q: params.q },
+        controller.signal,
+      )
+      .then((data) => dispatch({ type: 'loaded', generation, data }))
+      .catch((failure: unknown) => {
+        // A request this component itself superseded is never a user-facing
+        // error, so it is not reported at all.
+        if (controller.signal.aborted) return;
+        if (failure instanceof ApiError && failure.status === 401) {
+          // Dispatched, never called from here: signing the user out is an
+          // external side effect, and only the CURRENT request may cause one.
+          dispatch({ type: 'unauthorized', generation });
+          return;
+        }
+        dispatch({
+          type: 'failed',
+          generation,
+          message: failure instanceof ApiError ? failure.message : 'Failed to load bookings',
+        });
+      });
+    return () => controller.abort();
+    // `generation` changes on every navigation, filter change and refresh; the
+    // rest are listed because they are read above and are stable between bumps.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [generation, branchId, targetDate, statusFilter, query]);
+
+  /** The one place the board hands over to the login flow, driven by state the
+   * reducer accepted — so it runs once, and only for the current request. */
+  useEffect(() => {
+    if (authRequired) void toLogin();
+  }, [authRequired, toLogin]);
 
   const runAction = useCallback(
     async (booking: BookingDto, action: BookingAction): Promise<void> => {
@@ -127,27 +142,22 @@ export default function BoardPage() {
       setBusyId(booking.id);
       try {
         const { booking: updated } = await apiClient.transition(booking.id, action);
-        setBoard((current) =>
-          current
-            ? {
-                ...current,
-                bookings: current.bookings.map((b) => (b.id === updated.id ? updated : b)),
-              }
-            : current,
-        );
-        setNotice(null);
-      } catch (error) {
-        if (error instanceof ApiError && error.status === 401) {
+        dispatch({ type: 'booking', booking: updated });
+        setActionNotice(null);
+      } catch (failure) {
+        setActionNotice(failure instanceof ApiError ? failure.message : 'Action failed');
+        if (failure instanceof ApiError && failure.status === 401) {
           void toLogin();
           return;
         }
-        setNotice(error instanceof ApiError ? error.message : 'Action failed');
-        void loadBoard(); // board may be stale after a 409/403
+        // The board may be stale after a 409/403: reload it, and let that
+        // request's own outcome speak.
+        dispatch({ type: 'reload' });
       } finally {
         setBusyId(null);
       }
     },
-    [loadBoard, toLogin],
+    [toLogin],
   );
 
   if (!profile) {
@@ -192,7 +202,12 @@ export default function BoardPage() {
     );
   }
 
-  const shownDate = board?.date ?? date;
+  // Intent first, response second — the reverse of this line is the defect.
+  const shownDate = shownDateOf(state);
+  // Null while the label names a day (or branch) the committed data does not,
+  // so cards are never shown under a date they do not belong to.
+  const board = visibleBoard(state);
+  const notice = error ?? actionNotice;
 
   return (
     <div className="shell">
@@ -209,7 +224,7 @@ export default function BoardPage() {
             className="input"
             aria-label="Branch"
             value={branchId}
-            onChange={(event) => setBranchId(event.target.value)}
+            onChange={(event) => dispatch({ type: 'branch', branchId: event.target.value })}
           >
             {profile.branches.map((branch) => (
               <option key={branch.id} value={branch.id}>
@@ -244,8 +259,11 @@ export default function BoardPage() {
           <button
             className="btn ghost"
             aria-label="Previous day"
+            // Disabled only until the server has named a first day — never
+            // while a request is in flight, because rapid stepping is the
+            // point. Each click folds on the last INTENT, not the last response.
             disabled={!shownDate}
-            onClick={() => shownDate && setDate(addDaysToIsoDate(shownDate, -1))}
+            onClick={() => dispatch({ type: 'step', days: -1 })}
           >
             ‹
           </button>
@@ -254,11 +272,11 @@ export default function BoardPage() {
             className="btn ghost"
             aria-label="Next day"
             disabled={!shownDate}
-            onClick={() => shownDate && setDate(addDaysToIsoDate(shownDate, 1))}
+            onClick={() => dispatch({ type: 'step', days: 1 })}
           >
             ›
           </button>
-          <button className="btn ghost" onClick={() => setDate(undefined)}>
+          <button className="btn ghost" onClick={() => dispatch({ type: 'today' })}>
             Today
           </button>
           <input
@@ -273,7 +291,9 @@ export default function BoardPage() {
             className="input"
             aria-label="Status filter"
             value={statusFilter}
-            onChange={(event) => setStatusFilter(event.target.value as BookingStatus | '')}
+            onChange={(event) =>
+              dispatch({ type: 'status', status: event.target.value as BookingStatus | '' })
+            }
           >
             <option value="">All statuses</option>
             {BOOKING_STATUSES.map((status) => (
@@ -282,7 +302,7 @@ export default function BoardPage() {
               </option>
             ))}
           </select>
-          <button className="btn ghost" onClick={() => void loadBoard()}>
+          <button className="btn ghost" onClick={() => dispatch({ type: 'reload' })}>
             Refresh
           </button>
         </section>
@@ -293,7 +313,7 @@ export default function BoardPage() {
           </p>
         )}
 
-        {!board && loadingBoard ? (
+        {!board && loading ? (
           <p className="muted">Loading bookings…</p>
         ) : !board || board.bookings.length === 0 ? (
           <div className="empty">

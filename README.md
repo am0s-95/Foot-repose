@@ -139,6 +139,21 @@ Server-enforced guarantees:
   booking transition writes an `audit_logs` row (actor, entity, from/to
   status, ip), atomically with the change it records.
 
+Day navigation on the board is a small state machine
+(`apps/branch/src/lib/board-navigation.ts`), and the reason is a measured defect:
+the controls used to compute the next day from the last **loaded** response, so
+clicks issued while a board was still loading all started from the same day.
+Eleven "next" clicks moved the label zero days. Intent and response are now
+separate — a step folds on the previous **intent**, so N clicks are exactly N
+days across month, year and leap boundaries — and every request carries a
+monotonic generation, so only the newest may commit bookings, the date label, the
+loading state or an error. An older success, an older failure and a former
+branch's response are dropped on arrival. Cards are withheld whenever the
+committed response's day or branch is not the one on the label, so the board
+never shows one day's bookings under another day's date. The controls stay live
+while a request is in flight; serialising them would hide the problem rather than
+fix it.
+
 Workforce authentication (employee realm — kept strictly separate from the
 future customer realm):
 
