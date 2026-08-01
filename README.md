@@ -236,13 +236,39 @@ future customer realm):
   must be a bare origin — missing or malformed answers `503`, an unreachable
   upstream `502`, both as the API's structured JSON error with
   `cache-control: private, no-store` and no URL, DNS error or stack in the body.
-  A hung upstream is **not** addressed: there is no outbound timeout here, so
-  this does not solve F10. The evidence builds the artifact **once with a poison
+  A hung upstream **is** now addressed — see the outbound deadline below; that
+  closes this hop only, and is not a claim about F10 elsewhere in the system.
+  The evidence builds the artifact **once with a poison
   destination**, runs it from outside the repository against two different
   upstreams, and hashes the tree around the runs. The customer app is a
   different case, and is tested as such rather than assumed: its `API_URL` read
   is in a `force-dynamic` Server Component, so it is already a runtime read —
   its silent `http://localhost:3000` fallback remains, deliberately untouched.
+- The branch gateway holds an **outbound deadline** (`API_UPSTREAM_TIMEOUT_MS`,
+  default `15000`, accepted `100`–`120000`), read at run time per request like
+  the destination. Without it the gateway could wait forever, and measured on
+  the pre-fix standalone artifact it did — in **three** distinct places, each
+  reproduced against a real upstream over real sockets: an upstream that accepts
+  the request and never sends response headers (the wait is inside `fetch()`);
+  one that sends valid headers and then stalls mid-body (`fetch()` has already
+  resolved, so the wait is inside `response.arrayBuffer()`); and a streamed
+  request body sent to an upstream that stops consuming it. All three left the
+  branch request pending with no response byte produced. One `AbortController`
+  carries the deadline across all three phases, because a per-phase timeout
+  leaves their sum unbounded — and it is an **abort**, not a `Promise.race`,
+  because racing only stops this handler waiting while the upstream request
+  stays open, still holding a socket. The timer is released only after the body
+  has been read, not when the headers arrived. An expired request answers `504`
+  with `API request timed out`; that stays distinct from the `502` of an
+  unreachable or broken upstream, because 504 means the gateway decided to stop
+  waiting and points the operator at this variable rather than at the API. An
+  upstream's **own** 504 is relayed untouched and never synthesised here.
+  Nothing is retried on expiry. A malformed value fails closed with the same
+  `503` as a malformed `API_URL` — digits only, so `1e3`, `0x1F4`, `2000ms`,
+  `-1` and `1.5` are refused rather than coerced, since a deployment that asked
+  for `2000` and silently got `15000` is indistinguishable from one that asked
+  for nothing. The evidence runs the **same artifact** at two different
+  deadlines and hashes the tree around both runs.
 - The branch gateway is a new hop in front of the API, so the **F1** boundary is
   re-proven through it: `x-forwarded-for`, `forwarded`, `x-real-ip`,
   `cf-connecting-ip`, `true-client-ip`, `x-client-ip`, `x-forwarded-host`,

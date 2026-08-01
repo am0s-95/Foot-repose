@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { connect, createServer as createRawServer } from 'node:net';
-import type { Server as RawServer } from 'node:net';
+import type { Server as RawServer, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, relative, sep } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -48,12 +48,21 @@ const DEAD_PORT = 4195;
 const TRUNCATING_PORT = 4196;
 /** Records the request body AS IT ARRIVES, so streaming can be observed. */
 const STREAMING_PORT = 4197;
+/** [T2] Accepts the request and never sends a single response byte. */
+const SILENT_PORT = 4198;
+/** [T2] Sends valid headers and a partial body, then stalls and stays open. */
+const STALLING_PORT = 4199;
+/** [T2] Accepts the exchange, then stops consuming the request body. */
+const DEAF_PORT = 4200;
 
 const POISON_URL = `http://127.0.0.1:${POISON_PORT}`;
 const B_URL = `http://127.0.0.1:${B_PORT}`;
 const C_URL = `http://127.0.0.1:${C_PORT}`;
 const TRUNCATING_URL = `http://127.0.0.1:${TRUNCATING_PORT}`;
 const STREAMING_URL = `http://127.0.0.1:${STREAMING_PORT}`;
+const SILENT_URL = `http://127.0.0.1:${SILENT_PORT}`;
+const STALLING_URL = `http://127.0.0.1:${STALLING_PORT}`;
+const DEAF_URL = `http://127.0.0.1:${DEAF_PORT}`;
 
 interface Seen {
   method: string;
@@ -160,6 +169,90 @@ function startTruncatingUpstream(port: number): Promise<RawServer> {
   });
 }
 
+interface HangingUpstream {
+  hits: () => number;
+  /** Connections the GATEWAY tore down, which is what an abort actually looks
+   * like from this side. A deadline that only stopped waiting would leave these
+   * at zero and the socket open. */
+  closedByGateway: () => number;
+  close: () => Promise<void>;
+}
+
+/**
+ * [T2] An upstream that never completes, in each of the three ways the gateway
+ * could stall on it:
+ *
+ *   * `silent`   — accepts the request, sends no response byte at all, so the
+ *                  gateway is waiting for headers inside `fetch()`;
+ *   * `stalling` — sends valid headers and part of a body it never finishes, so
+ *                  `fetch()` has already RESOLVED and the wait is in
+ *                  `response.arrayBuffer()`. Raw sockets, because `http.Server`
+ *                  will not let a response under-deliver against its own
+ *                  Content-Length;
+ *   * `deaf`     — accepts the exchange and stops consuming the request body, so
+ *                  the stall is in the outgoing stream.
+ *
+ * All three were measured PENDING on the pre-fix artifact with no bound in
+ * sight; a per-phase guard would have caught at most one of them.
+ */
+function startHangingUpstream(
+  port: number,
+  behaviour: 'silent' | 'stalling' | 'deaf',
+): Promise<HangingUpstream> {
+  let hits = 0;
+  let closedByGateway = 0;
+  const sockets = new Set<Socket>();
+
+  const watch = (socket: Socket): void => {
+    sockets.add(socket);
+    socket.on('error', () => undefined);
+    socket.on('close', () => {
+      closedByGateway += 1;
+      sockets.delete(socket);
+    });
+  };
+
+  const server =
+    behaviour === 'stalling'
+      ? createRawServer((socket) => {
+          watch(socket);
+          socket.once('data', () => {
+            hits += 1;
+            socket.write(
+              'HTTP/1.1 200 OK\r\n' +
+                'content-type: application/json\r\n' +
+                // Promises 4096 bytes, delivers 16, and unlike the truncating
+                // upstream never closes — so the read has no reason to end.
+                'content-length: 4096\r\n' +
+                '\r\n' +
+                '{"partial":true,',
+            );
+          });
+        })
+      : createServer((req: IncomingMessage) => {
+          hits += 1;
+          if (behaviour === 'deaf') req.pause();
+          else req.resume();
+          // No response, ever.
+        });
+
+  if (behaviour !== 'stalling') server.on('connection', watch);
+
+  return new Promise((resolve) => {
+    server.listen(port, '127.0.0.1', () =>
+      resolve({
+        hits: () => hits,
+        closedByGateway: () => closedByGateway,
+        close: () =>
+          new Promise((done) => {
+            for (const socket of sockets) socket.destroy();
+            server.close(() => done());
+          }),
+      }),
+    );
+  });
+}
+
 interface StreamingUpstream {
   server: Server;
   /** Bytes received so far on the in-flight request — read WHILE it is open. */
@@ -237,6 +330,9 @@ let cUpstream: Upstream;
 let evil: Upstream;
 let truncating: RawServer;
 let streaming: StreamingUpstream;
+let silent: HangingUpstream;
+let stalling: HangingUpstream;
+let deaf: HangingUpstream;
 let hashAtBuild = '';
 
 async function startGateway(port: number, extraEnv: Record<string, string>): Promise<Gateway> {
@@ -282,6 +378,11 @@ beforeAll(async () => {
   ]);
   truncating = await startTruncatingUpstream(TRUNCATING_PORT);
   streaming = await startStreamingUpstream(STREAMING_PORT);
+  [silent, stalling, deaf] = await Promise.all([
+    startHangingUpstream(SILENT_PORT, 'silent'),
+    startHangingUpstream(STALLING_PORT, 'stalling'),
+    startHangingUpstream(DEAF_PORT, 'deaf'),
+  ]);
 
   // Built ONCE, with a destination that must never be used.
   execFileSync('npx', ['next', 'build'], {
@@ -306,6 +407,11 @@ afterAll(async () => {
     ),
     new Promise((resolve) => truncating?.close(() => resolve(null))),
     new Promise((resolve) => streaming?.server.close(() => resolve(null))),
+    // These hold connections open by design, so closing them destroys the
+    // sockets first — otherwise the suite would end waiting on its own props.
+    silent?.close(),
+    stalling?.close(),
+    deaf?.close(),
   ]);
 });
 
@@ -855,6 +961,289 @@ describe('[F29-4] the request body is streamed, not swallowed', () => {
     expect(source).not.toContain('req.arrayBuffer()');
     expect(source).toContain("duplex: 'half'");
   });
+});
+
+/**
+ * [T2] The outbound deadline, proven on the artifact that ships.
+ *
+ * Measured on pre-fix main 1fdd213, against this same standalone artifact: all
+ * three stall shapes below left the Branch request pending with no response
+ * byte produced, because neither `fetch()` nor `response.arrayBuffer()` had a
+ * signal or a deadline. A gateway that cannot stop waiting has no way to answer,
+ * so the caller's connection is held for as long as the upstream cares to keep
+ * it — which is not a property any deployment can absorb.
+ *
+ * Each test asserts three separate things, and the third is the one that
+ * distinguishes a real fix: the status is 504, the answer arrives no earlier
+ * than the deadline and no later than a bound, AND the upstream connection was
+ * torn down. `Promise.race` alone would satisfy the first two while leaving the
+ * upstream request open and still streaming into a body nobody reads.
+ */
+describe('[T2] a stalled upstream cannot hold a gateway request open', () => {
+  const DEADLINE_MS = 700;
+  /** Generous, because it exists to fail the test rather than to time it. */
+  const CEILING_MS = DEADLINE_MS + 6_000;
+
+  let silentGateway: Gateway;
+  let stallingGateway: Gateway;
+  let deafGateway: Gateway;
+
+  beforeAll(async () => {
+    [silentGateway, stallingGateway, deafGateway] = await Promise.all([
+      startGateway(3210, { API_URL: SILENT_URL, API_UPSTREAM_TIMEOUT_MS: String(DEADLINE_MS) }),
+      startGateway(3211, { API_URL: STALLING_URL, API_UPSTREAM_TIMEOUT_MS: String(DEADLINE_MS) }),
+      startGateway(3212, { API_URL: DEAF_URL, API_UPSTREAM_TIMEOUT_MS: String(DEADLINE_MS) }),
+    ]);
+  }, 180_000);
+
+  afterAll(() => {
+    silentGateway?.stop();
+    stallingGateway?.stop();
+    deafGateway?.stop();
+  });
+
+  /** The gateway's own answer, and how long it took to produce it. The signal
+   * is the test's own safety net: if the deadline did not work, this fails
+   * quickly and says so instead of hanging the suite. */
+  const timed = async (
+    base: string,
+    path: string,
+    init: RequestInit = {},
+  ): Promise<{ ms: number; status: number; body: string; cacheControl: string | null }> => {
+    const started = Date.now();
+    const response = await fetch(`${base}${path}`, {
+      ...init,
+      signal: AbortSignal.timeout(CEILING_MS),
+    });
+    const body = await response.text();
+    return {
+      ms: Date.now() - started,
+      status: response.status,
+      body,
+      cacheControl: response.headers.get('cache-control'),
+    };
+  };
+
+  /** The upstream's socket close is observed on the OTHER side of the wire, so
+   * it can land just after the caller has its answer. Poll rather than assume
+   * the two are ordered. */
+  const waitUntil = async (predicate: () => boolean, ms = 5_000): Promise<void> => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline && !predicate()) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  };
+
+  const expectTimeout = (result: { ms: number; status: number; body: string }): void => {
+    expect(result.status).toBe(504);
+    expect(result.body).toContain('"code":"internal_error"');
+    expect(result.body).toContain('API request timed out');
+    // Not answered early: the configured deadline is the deadline.
+    expect(result.ms).toBeGreaterThanOrEqual(DEADLINE_MS);
+    expect(result.ms).toBeLessThan(CEILING_MS);
+  };
+
+  it('cuts off an upstream that never sends response headers', async () => {
+    const before = silent.closedByGateway();
+    const result = await timed(silentGateway.base, '/api/auth/me');
+    expectTimeout(result);
+    expect(result.cacheControl).toBe('private, no-store');
+    expect(silent.hits()).toBeGreaterThan(0);
+    // The abort reached the socket, rather than this handler merely walking away.
+    await waitUntil(() => silent.closedByGateway() > before);
+    expect(silent.closedByGateway()).toBeGreaterThan(before);
+  }, 60_000);
+
+  it('cuts off an upstream that stalls after valid headers', async () => {
+    // The phase a fetch-only guard misses entirely: `fetch()` already resolved
+    // with 200 and the headers, and the wait is in the body read.
+    const before = stalling.closedByGateway();
+    const result = await timed(stallingGateway.base, '/api/auth/me');
+    expectTimeout(result);
+    // The upstream's 200 must NOT leak through as the answer.
+    expect(result.body).not.toContain('partial');
+    expect(stalling.hits()).toBeGreaterThan(0);
+    await waitUntil(() => stalling.closedByGateway() > before);
+    expect(stalling.closedByGateway()).toBeGreaterThan(before);
+  }, 60_000);
+
+  it('cuts off a streamed request whose upstream stopped consuming it', async () => {
+    const before = deaf.closedByGateway();
+    // A body that is never closed, so the exchange stays open from this side
+    // while the upstream refuses to read it.
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(64 * 1024));
+      },
+    });
+    const result = await timed(deafGateway.base, '/api/bookings/x/transition', {
+      method: 'POST',
+      body,
+      // @ts-expect-error duplex is required to send a stream body and is not yet
+      // in the DOM RequestInit types.
+      duplex: 'half',
+    });
+    expectTimeout(result);
+    expect(deaf.hits()).toBeGreaterThan(0);
+    await waitUntil(() => deaf.closedByGateway() > before);
+    expect(deaf.closedByGateway()).toBeGreaterThan(before);
+  }, 60_000);
+});
+
+/**
+ * [T2] The deadline is runtime configuration, held to the same standard as the
+ * destination: it must move between environments without a rebuild, and a value
+ * the operator did not knowingly write must fail closed rather than be coerced.
+ */
+describe('[T2] the deadline travels with the environment, not with the build', () => {
+  it('runs the same artifact at two different deadlines, with no mutation', async () => {
+    const measure = async (port: number, ms: string): Promise<number> => {
+      const gateway = await startGateway(port, {
+        API_URL: SILENT_URL,
+        API_UPSTREAM_TIMEOUT_MS: ms,
+      });
+      const started = Date.now();
+      const response = await fetch(`${gateway.base}/api/auth/me`, {
+        signal: AbortSignal.timeout(30_000),
+      });
+      const elapsed = Date.now() - started;
+      expect(response.status).toBe(504);
+      gateway.stop();
+      return elapsed;
+    };
+
+    // Anchored to the tree as it stands NOW rather than to `hashAtBuild`. The
+    // claim being made here is about these two runs — same bytes, two
+    // deadlines — and tying it to build time would silently make it depend on
+    // every earlier test in this file. [F29-B] already owns the build-time
+    // anchor for the destination.
+    const hashBefore = hashTree(artifactDir);
+
+    const fast = await measure(3213, '400');
+    const hashAfterFast = hashTree(artifactDir);
+    const slow = await measure(3214, '2500');
+
+    expect(fast).toBeGreaterThanOrEqual(400);
+    expect(slow).toBeGreaterThanOrEqual(2500);
+    // Separated by far more than scheduling noise: the environment decided this.
+    expect(slow - fast).toBeGreaterThan(1_500);
+
+    // ...and the bytes never changed, which is what makes it runtime config
+    // rather than two different builds that happen to disagree.
+    expect(hashAfterFast).toBe(hashBefore);
+    expect(hashTree(artifactDir)).toBe(hashBefore);
+  }, 300_000);
+
+  it.each([
+    ['0', 3220],
+    ['-1', 3221],
+    ['99', 3222],
+    ['120001', 3223],
+    ['abc', 3224],
+    ['1e3', 3225],
+    ['2000ms', 3226],
+  ])(
+    'refuses %s with the same structured 503 as a bad destination',
+    async (value, port) => {
+      const gateway = await startGateway(port as number, {
+        API_URL: B_URL,
+        API_UPSTREAM_TIMEOUT_MS: value as string,
+      });
+      const response = await fetch(`${gateway.base}/api/auth/me`);
+      const body = await response.text();
+      gateway.stop();
+      expect(response.status).toBe(503);
+      expect(body).toContain('"code":"internal_error"');
+      expect(body).toContain('API gateway is not configured');
+      // The rejected value must not travel back to the caller.
+      expect(body).not.toContain(value);
+    },
+    120_000,
+  );
+});
+
+/**
+ * [T2] What the deadline must NOT change. Every one of these passed before the
+ * deadline existed, so any of them breaking is the fix having overreached.
+ */
+describe('[T2] the deadline leaves working traffic alone', () => {
+  let gateway: Gateway;
+  const PORT = 3230;
+
+  beforeAll(async () => {
+    // Deliberately no API_UPSTREAM_TIMEOUT_MS: the documented default has to be
+    // the configuration that ordinary traffic runs under.
+    gateway = await startGateway(PORT, { API_URL: B_URL });
+  }, 120_000);
+
+  afterAll(() => gateway?.stop());
+
+  it('relays a normal response under the default deadline', async () => {
+    const response = await fetch(`${gateway.base}/api/auth/me`);
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { upstream: string }).upstream).toBe('UPSTREAM-B');
+  });
+
+  it("relays the upstream's OWN 504 rather than claiming the deadline fired", async () => {
+    // The one status the gateway can now also produce itself. They must stay
+    // distinguishable, or an operator cannot tell whose failure they are reading.
+    const response = await fetch(`${gateway.base}/api/status/504`);
+    const body = await response.text();
+    expect(response.status).toBe(504);
+    expect(body).toContain('UPSTREAM-B');
+    expect(body).not.toContain('API request timed out');
+  });
+
+  it('still forwards repeated query parameters, cookies and a streamed body', async () => {
+    const before = bUpstream.seen.length;
+    const response = await fetch(
+      `${gateway.base}/api/branches/b1/bookings?status=a&status=b&status=a`,
+      { headers: { cookie: 'fr_wf_session=abc' } },
+    );
+    expect(response.status).toBe(200);
+    const seen = bUpstream.seen.at(-1);
+    expect(bUpstream.seen.length).toBe(before + 1);
+    expect(seen?.url).toBe('/api/branches/b1/bookings?status=a&status=b&status=a');
+    expect(seen?.headers.cookie).toBe('fr_wf_session=abc');
+
+    const posted = await fetch(`${gateway.base}/api/bookings/x/transition`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'check_in' }),
+    });
+    expect(posted.status).toBe(200);
+    // Still streamed, still re-framed rather than copied.
+    expect(bUpstream.seen.at(-1)?.headers['transfer-encoding']).toBe('chunked');
+    expect(bUpstream.seen.at(-1)?.headers['content-length']).toBeUndefined();
+  });
+
+  it('still answers 502, not 504, when the connection is refused', async () => {
+    // The classifications must stay separate: unreachable is the upstream's
+    // failure, timed out is the gateway's decision.
+    const dead = await startGateway(3231, { API_URL: `http://127.0.0.1:${DEAD_PORT}` });
+    const response = await fetch(`${dead.base}/api/auth/me`);
+    const body = await response.text();
+    dead.stop();
+    expect(response.status).toBe(502);
+    expect(body).toContain('API is unavailable');
+  }, 120_000);
+
+  it('still answers 502 when the upstream dies mid-body before the deadline', async () => {
+    const truncated = await startGateway(3232, {
+      API_URL: TRUNCATING_URL,
+      API_UPSTREAM_TIMEOUT_MS: '10000',
+    });
+    const started = Date.now();
+    const response = await fetch(`${truncated.base}/api/auth/me`);
+    const body = await response.text();
+    const elapsed = Date.now() - started;
+    truncated.stop();
+    // A broken body is still 502 and still answered immediately — the deadline
+    // must not have converted it into a ten-second wait for a 504.
+    expect(response.status).toBe(502);
+    expect(body).toContain('API is unavailable');
+    expect(elapsed).toBeLessThan(5_000);
+  }, 120_000);
 });
 
 describe('[F29-A] the poisoned build destination was never used', () => {
