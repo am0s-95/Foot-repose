@@ -10,6 +10,12 @@ import {
 } from '@foot-repose/db/testing';
 import { closePool, getPool } from '../src/lib/pool';
 import { setupAllocationFixtures } from './allocation-helpers';
+import {
+  createScratchDatabase,
+  dropScratchDatabase,
+  urlForDatabase,
+  type ScratchDatabase,
+} from './scratch-database';
 
 const DB_PACKAGE_DIR = fileURLToPath(new URL('../../../packages/db', import.meta.url));
 
@@ -100,26 +106,37 @@ describe('TRUNCATE guards cover exactly the four history tables [R4A-4]', () => 
 });
 
 describe('seed refusal ordering [R4A-4 / A4.1]', () => {
-  const PROD_URL = 'postgres://postgres:postgres@127.0.0.1:5432/foot_repose_prod';
+  /**
+   * The stand-in production database.
+   *
+   * It used to be a FIXED `foot_repose_prod` on a HARDCODED
+   * `127.0.0.1:5432`, created with `DROP DATABASE IF EXISTS` first — so running
+   * this suite deleted any real database of that name on the local cluster,
+   * whatever `DATABASE_URL` said. It is now a uniquely named scratch database on
+   * the configured cluster, created without `IF NOT EXISTS` and dropped only
+   * because this file created it. See `scratch-database.ts`.
+   *
+   * What it has to BE for the test is unchanged: a live database whose name is
+   * not a development name, carrying rows that must survive. The divergence the
+   * guard defends against is a connection pooler — the URL says one thing,
+   * `current_database()` another.
+   */
+  let scratch: ScratchDatabase | null = null;
   let prod: Pool;
+  let PROD_URL: string;
 
   beforeAll(async () => {
-    // A live database that is NOT a development database, carrying rows that
-    // must survive. In production the divergence this guard defends against is
-    // a connection pooler: the URL says one thing, current_database() another.
-    const admin = new Pool({
-      connectionString: 'postgres://postgres:postgres@127.0.0.1:5432/postgres',
-    });
-    await admin.query('DROP DATABASE IF EXISTS foot_repose_prod');
-    await admin.query('CREATE DATABASE foot_repose_prod');
-    await admin.end();
-    prod = new Pool({ connectionString: PROD_URL });
+    scratch = await createScratchDatabase(getPool(), (t) => `foot_repose_prod_history_${t}`);
+    prod = scratch.pool;
+    PROD_URL = scratch.url;
     await prod.query('CREATE TABLE sentinel (id int primary key)');
     await prod.query('INSERT INTO sentinel VALUES (1), (2), (3)');
   }, 60_000);
 
   afterAll(async () => {
-    await prod.end();
+    // Runs even when a test above failed, and drops only what we created.
+    await dropScratchDatabase(getPool(), scratch);
+    scratch = null;
   });
 
   /**
@@ -151,9 +168,10 @@ describe('seed refusal ordering [R4A-4 / A4.1]', () => {
     let migrateCalls = 0;
     await expect(
       prepareSeed({
-        // Textual input looks like a development database: the three textual
-        // guards pass, so the live check is the only thing that can refuse.
-        databaseUrl: 'postgres://postgres:postgres@127.0.0.1:5432/foot_repose_dev',
+        // Textual input looks like a development database — and points at the
+        // configured cluster, not a written-down one — so the three textual
+        // guards pass and the live check is the only thing that can refuse.
+        databaseUrl: urlForDatabase('foot_repose_dev'),
         env: { NODE_ENV: 'development', SEED_CONFIRM: 'wipe' },
         liveDatabaseName: async () =>
           (await prod.query<{ db: string }>('SELECT current_database() AS db')).rows[0]!.db,
@@ -161,7 +179,8 @@ describe('seed refusal ordering [R4A-4 / A4.1]', () => {
           migrateCalls += 1;
         },
       }),
-    ).rejects.toThrow(/Refusing to seed \(before migrations\).*foot_repose_prod/s);
+      // Names the scratch database this test created, not a fixed production name.
+    ).rejects.toThrow(new RegExp(`Refusing to seed \\(before migrations\\)[\\s\\S]*${scratch!.name}`));
 
     expect(migrateCalls).toBe(0);
     const after = await prod.query<{ versions: string; branches: number }>(

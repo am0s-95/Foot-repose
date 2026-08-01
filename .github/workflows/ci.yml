@@ -15,14 +15,19 @@ jobs:
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: foot_repose_test
-        ports: ['5432:5432']
+        # Deliberately NOT 5432. This job runs `npm run test`, which is where a
+        # test once dialled a hardcoded 127.0.0.1:5432 and dropped whatever
+        # database it found there, ignoring TEST_DATABASE_URL entirely. On a
+        # non-default host port that mistake cannot connect at all, so it fails
+        # the job instead of destroying data on somebody's machine.
+        ports: ['55432:5432']
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
     env:
-      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/foot_repose_test
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:55432/foot_repose_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -31,9 +36,9 @@ jobs:
           cache: npm
       - name: Assert the pinned PostgreSQL server version
         run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -d foot_repose_test \
+          PGPASSWORD=postgres psql -h localhost -p 55432 -U postgres -d foot_repose_test \
             -c 'SELECT version();' -tA
-          num=$(PGPASSWORD=postgres psql -h localhost -U postgres -d foot_repose_test \
+          num=$(PGPASSWORD=postgres psql -h localhost -p 55432 -U postgres -d foot_repose_test \
             -tAc 'SHOW server_version_num')
           echo "server_version_num=$num"
           test "$num" = "160013" || {
