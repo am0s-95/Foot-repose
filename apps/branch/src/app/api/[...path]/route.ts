@@ -118,6 +118,31 @@ function gatewayError(status: number, message: string): Response {
   });
 }
 
+/**
+ * [T2] Who ended the upstream request.
+ *
+ * The two causes need different answers, so the reason has to be recorded
+ * rather than inferred: `AbortSignal.aborted` says THAT the request was
+ * aborted, never BY WHOM, and once there are two possible aborters that is no
+ * longer enough to classify the failure.
+ */
+type AbortSource = 'deadline' | 'client';
+
+/**
+ * The caller is gone, so there is nobody to answer.
+ *
+ * Thrown rather than returned: inventing a 502/503/504 here would mean
+ * fabricating a public error contract for a browser that has already
+ * disconnected, and logging it as an upstream failure would put a permanent
+ * error in the operator's log every time an employee closes a tab. An
+ * `AbortError` is what the runtime already understands as "this request ended
+ * with its caller".
+ */
+function callerGone(reason: unknown): Error {
+  if (reason instanceof Error) return reason;
+  return new DOMException('The incoming request was cancelled by its caller.', 'AbortError');
+}
+
 function badRequest(message: string): Response {
   return new Response(JSON.stringify({ error: { code: 'validation_error', message } }), {
     status: 400,
@@ -178,6 +203,12 @@ async function forward(req: Request): Promise<Response> {
   const target = resolveTarget(incoming.pathname, incoming.search, upstream);
   if (target === null) return badRequest('Unsupported API path');
 
+  // [T2] A caller that has ALREADY gone gets no upstream request at all. Not an
+  // optimisation: without it the gateway opens a connection, sends a body and
+  // occupies one of the API's slots on behalf of nobody, and for a non-GET that
+  // is a booking transition performed for a request its caller abandoned.
+  if (req.signal.aborted) throw callerGone(req.signal.reason);
+
   // STREAMED, not buffered. Reading the body first would hold an entire
   // attacker-chosen payload in this process before the upstream — which has the
   // body limits — ever sees a byte, and this gateway is reachable
@@ -202,11 +233,31 @@ async function forward(req: Request): Promise<Response> {
   // so that is what carries the deadline. The same signal covers all three
   // phases because it is attached to the fetch: it aborts the outgoing body
   // stream, the headers wait, and the response body stream alike.
+  //
+  // TWO things can end it, and they are not interchangeable. The deadline is
+  // the gateway giving up on the API and owes the caller a 504. A caller that
+  // disconnects owes nobody anything — but the upstream work it started must
+  // still stop, or an employee closing a tab leaves a request running against
+  // the API for the rest of the deadline. Both abort the SAME controller, so
+  // the upstream is released either way; only the answer differs.
+  //
+  // Every controller and every flag here is per-request. Nothing is shared, so
+  // one caller's cancellation cannot reach another caller's request.
   const clock = new AbortController();
-  const expiry = setTimeout(
-    () => clock.abort(new Error(`gateway deadline of ${deadlineMs}ms exceeded`)),
-    deadlineMs,
-  );
+  let abortedBy: AbortSource | null = null;
+
+  // First cause wins and is never overwritten: a timer that fires just after a
+  // disconnect must not relabel it a timeout, and a disconnect just after the
+  // deadline must not erase a 504 the caller is owed. Re-aborting an already
+  // aborted controller is a no-op, so the ordering is decided here alone.
+  const claim = (source: AbortSource): void => {
+    abortedBy ??= source;
+    clock.abort();
+  };
+
+  const expiry = setTimeout(() => claim('deadline'), deadlineMs);
+  const onCallerGone = (): void => claim('client');
+  req.signal.addEventListener('abort', onCallerGone, { once: true });
 
   try {
     let response: Response;
@@ -224,10 +275,11 @@ async function forward(req: Request): Promise<Response> {
         signal: clock.signal,
       } as RequestInit & { duplex: 'half' });
     } catch (error) {
-      // Only this handler's own timer can abort this signal, so `aborted` is an
-      // unambiguous statement about WHOSE failure this is: the gateway's
-      // deadline, not the upstream's connection.
-      if (clock.signal.aborted) {
+      // `clock.signal.aborted` is deliberately NOT the test: it is true for
+      // both causes and would report an employee closing a tab as an API
+      // timeout. The recorded source is the only thing that distinguishes them.
+      if (abortedBy === 'client') throw callerGone(req.signal.reason);
+      if (abortedBy === 'deadline') {
         console.error(`[gateway] upstream deadline of ${deadlineMs}ms exceeded before headers`);
         return gatewayError(GATEWAY_DEADLINE_EXCEEDED, 'API request timed out');
       }
@@ -252,7 +304,8 @@ async function forward(req: Request): Promise<Response> {
         // The deadline reaches this phase too, and it is the phase that most
         // needed it: an upstream that sends valid headers and then stalls kept
         // this read open with the status already decided.
-        if (clock.signal.aborted) {
+        if (abortedBy === 'client') throw callerGone(req.signal.reason);
+        if (abortedBy === 'deadline') {
           console.error(`[gateway] upstream deadline of ${deadlineMs}ms exceeded reading body`);
           return gatewayError(GATEWAY_DEADLINE_EXCEEDED, 'API request timed out');
         }
@@ -267,9 +320,13 @@ async function forward(req: Request): Promise<Response> {
       headers: inboundHeaders(response),
     });
   } finally {
-    // The deadline covers the complete exchange, so it is only released once
-    // the body has been read — not when the headers arrived.
+    // Every exit runs this: success, 502, deadline 504, caller cancellation and
+    // a failed body read alike. The deadline covers the complete exchange, so
+    // it is only released once the body has been read — not when the headers
+    // arrived — and the listener goes with it so a long-lived incoming signal
+    // cannot accumulate handlers from finished requests.
     clearTimeout(expiry);
+    req.signal.removeEventListener('abort', onCallerGone);
   }
 }
 

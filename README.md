@@ -269,6 +269,27 @@ future customer realm):
   for `2000` and silently got `15000` is indistinguishable from one that asked
   for nothing. The evidence runs the **same artifact** at two different
   deadlines and hashes the tree around both runs.
+- The same abort has a **second owner: the caller**. A deadline-only version of
+  this shipped first and was incomplete — the timer was the only thing that
+  could abort the upstream, so an employee closing a tab left the upload, the
+  headers wait or the body read running against the API for the rest of the
+  deadline, fifteen seconds per abandoned request by default. The incoming
+  `req.signal` now aborts the same controller, and a request that arrives
+  already cancelled starts no upstream request at all — which matters most for
+  a non-GET, where forwarding one would perform a booking transition on behalf
+  of a caller that had gone. Both causes are recorded, because
+  `AbortSignal.aborted` says only THAT something aborted, never by whom: the
+  first cause wins and is never relabelled, so a timer firing just after a
+  disconnect cannot report it as an API timeout, and a disconnect just after
+  the deadline cannot retract a 504 the caller is owed. A cancelled caller gets
+  no invented status and no upstream-failure log line — there is nobody left to
+  answer, and logging it would fill the operator's log with errors every time
+  someone closes a tab. Every controller, flag and listener is per request, and
+  the listener is removed with the timer on every exit path. Measured against
+  the deadline-only commit: cancelling before response headers, and cancelling
+  during a stalled body, both left the upstream connection open until the
+  deadline expired; cancelling mid-upload already tore it down, incidentally,
+  because the incoming body stream *is* the outgoing one.
 - The branch gateway is a new hop in front of the API, so the **F1** boundary is
   re-proven through it: `x-forwarded-for`, `forwarded`, `x-real-ip`,
   `cf-connecting-ip`, `true-client-ip`, `x-client-ip`, `x-forwarded-host`,
